@@ -20,6 +20,7 @@ import numpy as np
 CONTINUE_READING_TEXT = "继续阅读"
 RECENT_READING_TEXT = "最近阅读"
 PROGRESS_PREFIX = "进度:"
+EXCLUDED_COLLECTION_CATEGORIES = {"重点图书"}
 
 
 def log(message: str) -> None:
@@ -107,6 +108,7 @@ class RuntimeConfig:
     max_page_turns: int
     max_minutes: int
     debug_dir: Optional[str]
+    selection_blacklist_file: Optional[str]
 
 
 @dataclass
@@ -238,6 +240,10 @@ def load_config(path: Path) -> ReaderConfig:
             max_page_turns=int(runtime.get("max_page_turns", 30)),
             max_minutes=int(runtime.get("max_minutes", 0)),
             debug_dir=runtime.get("debug_dir"),
+            selection_blacklist_file=runtime.get(
+                "selection_blacklist_file",
+                "selection_blacklist.json",
+            ),
         ),
     )
 
@@ -493,6 +499,22 @@ class UiNavigator:
             return bounds
         return None
 
+    def find_text_prefix_bounds(
+        self,
+        root: ET.Element,
+        prefix: str,
+    ) -> Optional[tuple[str, tuple[int, int, int, int]]]:
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text.startswith(prefix) or not bounds_text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            return text, bounds
+        return None
+
     def detail_title(self, root: ET.Element) -> Optional[str]:
         start_bounds = self.find_text_bounds(root, "开始阅读")
         if not start_bounds:
@@ -647,6 +669,63 @@ class UiNavigator:
         x1, y1, x2, y2 = min(candidates, key=lambda item: (item[1], item[0]))
         return max(0, x1 - 24), max(0, y1 - 180), x2 + 24, y2 + 24
 
+    def current_collection_category(self, root: ET.Element) -> Optional[str]:
+        subtree = self._page_subtree(root, "collection")
+        if subtree is None:
+            return None
+
+        found = self.find_text_prefix_bounds(subtree, "分类：")
+        if not found:
+            return None
+        text, _ = found
+        return text.removeprefix("分类：").strip()
+
+    def find_collection_category_trigger(
+        self,
+        root: ET.Element,
+    ) -> Optional[tuple[int, int, int, int]]:
+        subtree = self._page_subtree(root, "collection")
+        if subtree is None:
+            return None
+
+        found = self.find_text_prefix_bounds(subtree, "分类：")
+        if not found:
+            return None
+        _, bounds = found
+        x1, y1, x2, y2 = bounds
+        return max(0, x1 - 64), max(0, y1 - 20), x2 + 48, y2 + 20
+
+    def list_collection_categories(
+        self,
+        root: ET.Element,
+    ) -> list[tuple[str, tuple[int, int, int, int]]]:
+        subtree = self._page_subtree(root, "collection")
+        if subtree is None:
+            return []
+
+        categories: list[tuple[str, tuple[int, int, int, int]]] = []
+        seen: set[str] = set()
+        current = self.current_collection_category(root)
+        for node in iter_nodes(subtree):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text or not bounds_text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            if not (660 <= bounds[1] <= 1860):
+                continue
+            if not (180 <= bounds[2] - bounds[0] <= 360):
+                continue
+            if not (100 <= bounds[3] - bounds[1] <= 140):
+                continue
+            if text == current or text in seen:
+                continue
+            categories.append((text, bounds))
+            seen.add(text)
+        return categories
+
     def list_collection_books(self, root: ET.Element) -> list[RecentBook]:
         items: list[RecentBook] = []
         seen: set[tuple[int, int, int, int]] = set()
@@ -759,6 +838,129 @@ class HaoceReader:
             Path(config.runtime.debug_dir).resolve()
             if config.runtime.debug_dir
             else None
+        )
+        self.selection_blacklist_path = (
+            Path(config.runtime.selection_blacklist_file).resolve()
+            if config.runtime.selection_blacklist_file
+            else None
+        )
+        self.selection_blacklist_titles: set[str] = set()
+        self.selection_blacklist_keys: set[str] = set()
+        self._load_selection_blacklist()
+
+    def _normalize_book_title(self, title: Optional[str]) -> Optional[str]:
+        if not title:
+            return None
+        normalized = " ".join(title.split()).strip()
+        if (
+            not normalized
+            or normalized in {"•", "<unknown>"}
+            or normalized.startswith("collection-slot-")
+        ):
+            return None
+        return normalized
+
+    def _selection_blacklist_key(self, book: RecentBook) -> Optional[str]:
+        if not book.image_key:
+            return None
+        normalized = book.image_key.strip()
+        return normalized or None
+
+    def _load_selection_blacklist(self) -> None:
+        if not self.selection_blacklist_path or not self.selection_blacklist_path.exists():
+            return
+        try:
+            payload = json.loads(
+                self.selection_blacklist_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            log(f"failed to load selection blacklist file: {exc}")
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        for value in payload.get("titles", []):
+            normalized = self._normalize_book_title(str(value))
+            if normalized:
+                self.selection_blacklist_titles.add(normalized)
+
+        for value in payload.get("keys", []):
+            normalized = str(value).strip()
+            if normalized:
+                self.selection_blacklist_keys.add(normalized)
+
+    def _save_selection_blacklist(self) -> None:
+        if not self.selection_blacklist_path:
+            return
+
+        payload = {
+            "titles": sorted(self.selection_blacklist_titles),
+            "keys": sorted(self.selection_blacklist_keys),
+        }
+        try:
+            self.selection_blacklist_path.parent.mkdir(parents=True, exist_ok=True)
+            self.selection_blacklist_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log(f"failed to save selection blacklist file: {exc}")
+
+    def _selection_blacklist_contains(self, book: RecentBook) -> bool:
+        title = self._normalize_book_title(book.title)
+        if title and title in self.selection_blacklist_titles:
+            return True
+
+        key = self._selection_blacklist_key(book)
+        if key and key in self.selection_blacklist_keys:
+            return True
+
+        return False
+
+    def _remember_selected_for_collection(self, book: RecentBook) -> None:
+        changed = False
+
+        title = self._normalize_book_title(book.title)
+        if title and title not in self.selection_blacklist_titles:
+            self.selection_blacklist_titles.add(title)
+            changed = True
+
+        key = self._selection_blacklist_key(book)
+        if key and key not in self.selection_blacklist_keys:
+            self.selection_blacklist_keys.add(key)
+            changed = True
+
+        if changed:
+            self._save_selection_blacklist()
+
+    def _resolve_collection_book(
+        self,
+        candidate_root: ET.Element,
+        fallback_book: RecentBook,
+    ) -> RecentBook:
+        title = (
+            self.navigator.report_title(candidate_root)
+            or self.navigator.detail_title(candidate_root)
+            or fallback_book.title
+        )
+        progress = self.navigator.report_progress(candidate_root)
+        if progress is None:
+            progress = self.navigator.detail_progress(candidate_root)
+        if progress is None:
+            progress = fallback_book.progress_percent
+
+        progress_text = (
+            f"进度:{progress:.2f}%"
+            if progress is not None
+            else (fallback_book.progress_text or "进度:unknown")
+        )
+        return RecentBook(
+            title=title,
+            image_key=fallback_book.image_key,
+            progress_text=progress_text,
+            progress_percent=progress,
+            bounds=fallback_book.bounds,
         )
 
     def _ratio_to_abs(self, point: tuple[float, float]) -> tuple[int, int]:
@@ -898,16 +1100,26 @@ class HaoceReader:
         x, y = center(book.bounds)
         log(f"opening collection book: {self._describe_book(book)} at {x},{y}")
         self.device.tap(x, y)
-        self.current_book = book
         self._sleep_ms(self.config.navigation.prepare_wait_ms)
         candidate_root = self.device.dump_ui()
+        if self.navigator._current_page_name(candidate_root) == "collection":
+            log("collection card tap did not leave the collection page")
+            return "open_collection_miss"
+
+        selected_book = self._resolve_collection_book(candidate_root, book)
+        if self._selection_blacklist_contains(selected_book):
+            self._remember_selected_for_collection(selected_book)
+            log("selected collection book is already in selection blacklist, going back")
+            self.device.back()
+            self._sleep_ms(self.config.navigation.prepare_wait_ms)
+            return "open_collection_blacklisted"
+
+        self.current_book = selected_book
+        self._remember_selected_for_collection(selected_book)
         if self._tap_continue_if_present(candidate_root):
             return "open_collection_then_continue"
         if self._tap_start_reading_if_present(candidate_root):
             return "open_collection_then_start"
-        if self.navigator._current_page_name(candidate_root) == "collection":
-            log("collection card tap did not leave the collection page")
-            return "open_collection_miss"
         return "open_collection"
 
     def _open_home_collection_page(self, root: ET.Element) -> Optional[ET.Element]:
@@ -924,6 +1136,145 @@ class HaoceReader:
                 return current_root
         return None
 
+    def _pick_next_book_from_collection_root(
+        self,
+        collection_root: ET.Element,
+    ) -> str:
+        collection_root = self._choose_random_collection_category(collection_root)
+        collection_root = self._randomize_collection_start(collection_root)
+
+        for _ in range(4):
+            next_book = self._find_next_collection_book(collection_root)
+            if not next_book:
+                break
+
+            action = self._open_collection_book(next_book)
+            if action == "open_collection_blacklisted":
+                collection_root = self.device.dump_ui()
+                continue
+            if action == "open_collection_miss":
+                log("parsed collection card did not open, falling back to visible slot scanning")
+                break
+
+            log(f"switched to next book: {self._describe_book(next_book)}, action={action}")
+            return "opened_next"
+
+        log("collection page UI did not expose book cards, falling back to visible slot scanning")
+        action = self._open_next_collection_book_by_slots(collection_root)
+        if action in {
+            "open_collection",
+            "open_collection_then_continue",
+            "open_collection_then_start",
+        }:
+            log(f"switched to next book by slot fallback, action={action}")
+            return "opened_next"
+
+        self.current_book = None
+        log("no unfinished book found in the collection page, stopping")
+        return "all_done"
+
+    def _open_collection_category_picker(
+        self,
+        root: ET.Element,
+    ) -> Optional[ET.Element]:
+        bounds = self.navigator.find_collection_category_trigger(root)
+        if not bounds:
+            return None
+        x, y = center(bounds)
+        log(f"opening collection category picker at {x},{y}")
+        self.device.tap(x, y)
+        self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1500))
+        return self.device.dump_ui()
+
+    def _close_collection_category_picker(self) -> ET.Element:
+        self.device.tap(*self._ratio_to_abs((0.92, 0.28)))
+        self._sleep_ms(1000)
+        return self.device.dump_ui()
+
+    def _choose_random_collection_category(
+        self,
+        root: ET.Element,
+    ) -> ET.Element:
+        current_category = self.navigator.current_collection_category(root)
+        popup_root = self._open_collection_category_picker(root)
+        if popup_root is None:
+            log("collection category picker was not found, keeping current category")
+            return root
+
+        categories = self.navigator.list_collection_categories(popup_root)
+        allowed = [
+            item
+            for item in categories
+            if item[0] not in EXCLUDED_COLLECTION_CATEGORIES
+        ]
+
+        if not allowed:
+            if current_category in EXCLUDED_COLLECTION_CATEGORIES:
+                log("no allowed collection category was found after excluding 重点图书")
+            else:
+                log("no alternative collection category was found, keeping current category")
+            return self._close_collection_category_picker()
+
+        chosen_name, chosen_bounds = random.choice(allowed)
+        x, y = center(chosen_bounds)
+        log(
+            f"switching collection category from "
+            f"{current_category or '<unknown>'} to {chosen_name}"
+        )
+        self.device.tap(x, y)
+        self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 2000))
+        updated_root = self.device.dump_ui()
+        updated_category = self.navigator.current_collection_category(updated_root)
+        if updated_category:
+            log(f"current collection category: {updated_category}")
+        return updated_root
+
+    def _scroll_collection_page(self) -> ET.Element:
+        log("scrolling collection page to look for more books")
+        self._swipe_ratio((0.5, 0.82), (0.5, 0.3), 650)
+        self._sleep_ms(self.config.page_turn.settle_ms)
+        return self.device.dump_ui()
+
+    def _randomize_collection_start(
+        self,
+        root: ET.Element,
+        max_random_scrolls: int = 3,
+    ) -> ET.Element:
+        scrolls = random.randint(0, max_random_scrolls)
+        if scrolls <= 0:
+            return root
+
+        log(
+            f"randomizing collection start page: scrolling {scrolls} screen(s) before selecting"
+        )
+        current_root = root
+        for _ in range(scrolls):
+            current_root = self._scroll_collection_page()
+        return current_root
+
+    def _should_skip_collection_book(self, book: RecentBook) -> bool:
+        if book.key in self.completed_book_keys:
+            return True
+        if book.is_complete():
+            return True
+        if self._selection_blacklist_contains(book):
+            return True
+        if (
+            self.current_book
+            and self.current_book.title
+            and book.title
+            and self.current_book.title.strip() == book.title.strip()
+        ):
+            return True
+        return False
+
+    def _open_next_book_from_collection(self, root: ET.Element) -> str:
+        collection_root = self._open_home_collection_page(root)
+        if collection_root is None:
+            log("home collection entry was not found, cannot choose the next book")
+            return "stop"
+        return self._pick_next_book_from_collection_root(collection_root)
+
     def _find_next_collection_book(
         self,
         root: ET.Element,
@@ -938,19 +1289,22 @@ class HaoceReader:
                 break
             seen_signatures.add(signature)
 
-            for book in books:
-                if book.key in self.completed_book_keys:
-                    continue
-                if not book.is_complete():
-                    return book
+            candidates = [
+                book for book in books if not self._should_skip_collection_book(book)
+            ]
+            if candidates:
+                chosen = random.choice(candidates)
+                log(
+                    f"randomly selected one visible collection book from "
+                    f"{len(candidates)} candidate(s): {self._describe_book(chosen)}"
+                )
+                return chosen
 
             if attempt == max_scrolls:
                 break
 
-            log("no unfinished visible collection book yet, scrolling collection list")
-            self._swipe_ratio((0.5, 0.8), (0.5, 0.34), 550)
-            self._sleep_ms(self.config.page_turn.settle_ms)
-            root = self.device.dump_ui()
+            log("no selectable visible collection book yet, moving to another collection screen")
+            root = self._scroll_collection_page()
 
         return None
 
@@ -972,7 +1326,9 @@ class HaoceReader:
         tried_slots: set[tuple[int, int, int]] = set()
 
         for page_index in range(max_pages):
-            for slot_index, point in enumerate(self._collection_slot_points()):
+            slot_candidates = list(enumerate(self._collection_slot_points(), start=1))
+            random.shuffle(slot_candidates)
+            for slot_index, point in slot_candidates:
                 slot_key = (page_index, point[0], point[1])
                 if slot_key in tried_slots:
                     continue
@@ -1016,9 +1372,36 @@ class HaoceReader:
                     if progress is not None
                     else "进度:unknown"
                 )
+                selected_book = RecentBook(
+                    title=title,
+                    image_key=None,
+                    progress_text=progress_text,
+                    progress_percent=progress,
+                    bounds=(0, 0, 0, 0),
+                )
                 log(
                     f"collection candidate opened: {title}, progress={progress_text}"
                 )
+
+                if (
+                    self.current_book
+                    and self.current_book.title
+                    and title
+                    and self.current_book.title.strip() == title.strip()
+                ):
+                    log("candidate book matches the current book, going back to try another one")
+                    self.device.back()
+                    self._sleep_ms(self.config.navigation.prepare_wait_ms)
+                    root = self.device.dump_ui()
+                    continue
+
+                if self._selection_blacklist_contains(selected_book):
+                    self._remember_selected_for_collection(selected_book)
+                    log("candidate book is already in selection blacklist, going back")
+                    self.device.back()
+                    self._sleep_ms(self.config.navigation.prepare_wait_ms)
+                    root = self.device.dump_ui()
+                    continue
 
                 if progress is not None and progress >= 99.9:
                     log("candidate book is already complete, going back to collection page")
@@ -1027,13 +1410,8 @@ class HaoceReader:
                     root = self.device.dump_ui()
                     continue
 
-                self.current_book = RecentBook(
-                    title=title,
-                    image_key=None,
-                    progress_text=progress_text,
-                    progress_percent=progress,
-                    bounds=(0, 0, 0, 0),
-                )
+                self.current_book = selected_book
+                self._remember_selected_for_collection(selected_book)
                 if self._tap_continue_if_present(candidate_root):
                     return "open_collection_then_continue"
                 if self._tap_start_reading_if_present(candidate_root):
@@ -1043,21 +1421,36 @@ class HaoceReader:
             if page_index == max_pages - 1:
                 break
 
-            log("scrolling collection page to look for more books")
-            self._swipe_ratio((0.5, 0.82), (0.5, 0.3), 650)
-            self._sleep_ms(self.config.page_turn.settle_ms)
-            root = self.device.dump_ui()
+            root = self._scroll_collection_page()
 
         return "all_done"
 
     def _prepare_reading_page(self) -> str:
         root = self.device.dump_ui()
+        page_name = self.navigator._current_page_name(root)
+
+        if page_name == "collection":
+            log("already on collection page during prepare, choosing a book from current collection")
+            return self._pick_next_book_from_collection_root(root)
 
         if self._tap_continue_if_present(root):
             return "continue"
 
+        items = self.navigator.list_recent_books(root)
+        if items:
+            first_recent = items[0]
+            if first_recent.is_complete():
+                self.completed_book_keys.add(first_recent.key)
+                log(
+                    "first recent book is already complete, "
+                    "opening collection page to choose a new book"
+                )
+                result = self._open_next_book_from_collection(root)
+                if result == "opened_next":
+                    return "first_recent_complete_then_opened_next"
+                return result
+
         if self.config.navigation.open_recent_index and self.config.navigation.open_recent_index > 0:
-            items = self.navigator.list_recent_books(root)
             if items and len(items) >= self.config.navigation.open_recent_index:
                 return self._open_recent_book(
                     items[self.config.navigation.open_recent_index - 1]
@@ -1145,34 +1538,7 @@ class HaoceReader:
 
         self.completed_book_keys.add(current_on_home.key)
         log(f"book completed: {self._describe_book(current_on_home)}")
-
-        collection_root = self._open_home_collection_page(root)
-        if collection_root is None:
-            log("home collection entry was not found, cannot choose the next book")
-            return "stop"
-
-        next_book = self._find_next_collection_book(collection_root)
-        if next_book:
-            action = self._open_collection_book(next_book)
-            if action == "open_collection_miss":
-                log("parsed collection card did not open, falling back to visible slot scanning")
-            else:
-                log(f"switched to next book: {self._describe_book(next_book)}, action={action}")
-                return "opened_next"
-
-        log("collection page UI did not expose book cards, falling back to visible slot scanning")
-        action = self._open_next_collection_book_by_slots(collection_root)
-        if action in {
-            "open_collection",
-            "open_collection_then_continue",
-            "open_collection_then_start",
-        }:
-            log(f"switched to next book by slot fallback, action={action}")
-            return "opened_next"
-
-        self.current_book = None
-        log("no unfinished book found in the collection page, stopping")
-        return "all_done"
+        return self._open_next_book_from_collection(root)
 
     def doctor(self) -> int:
         self.device.ensure_ready()
@@ -1208,9 +1574,10 @@ class HaoceReader:
         log(f"screenshot saved to {output}")
         return 0
 
-    def prepare(self, skip_prepare: bool = False) -> None:
+    def prepare(self, skip_prepare: bool = False) -> str:
         self.device.ensure_ready()
         self.screen_size = self.device.wm_size()
+        result = "noop"
         if self.config.navigation.launch_app:
             log(f"launching {self.config.package}")
             self.device.launch_app()
@@ -1218,6 +1585,7 @@ class HaoceReader:
         if not skip_prepare:
             result = self._prepare_reading_page()
             log(f"prepare result: {result}")
+        return result
 
     def perform_scroll(self) -> None:
         start = self._randomized_point(
@@ -1276,7 +1644,13 @@ class HaoceReader:
         skip_prepare: bool = False,
         max_page_turns_override: Optional[int] = None,
     ) -> int:
-        self.prepare(skip_prepare=skip_prepare)
+        prepare_result = self.prepare(skip_prepare=skip_prepare)
+        if prepare_result == "all_done":
+            log("no unread book found during prepare, stopping")
+            return 0
+        if prepare_result == "stop":
+            log("prepare step did not reach a safe reading page, stopping")
+            return 2
 
         max_page_turns = (
             max_page_turns_override
