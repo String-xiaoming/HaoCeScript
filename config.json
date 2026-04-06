@@ -1,0 +1,75 @@
+{
+  "serial": null,
+  "package": "app.haoce.com",
+  "navigation": {
+    "launch_app": true,
+    "open_recent_index": 1,
+    "auto_continue_from_report": true,
+    "prepare_wait_ms": 2000
+  },
+  "scroll": {
+    "start": [
+      0.5,
+      0.8
+    ],
+    "start_jitter": [
+      0.03,
+      0.025
+    ],
+    "end": [
+      0.5,
+      0.28
+    ],
+    "end_jitter": [
+      0.03,
+      0.025
+    ],
+    "duration_ms": 520,
+    "duration_jitter_ms": 180,
+    "settle_ms": 1200,
+    "pause_ms": 15000
+  },
+  "page_turn": {
+    "action": "swipe",
+    "start": [
+      0.83,
+      0.58
+    ],
+    "start_jitter": [
+      0.018,
+      0.015
+    ],
+    "end": [
+      0.17,
+      0.58
+    ],
+    "end_jitter": [
+      0.018,
+      0.015
+    ],
+    "tap": null,
+    "duration_ms": 320,
+    "duration_jitter_ms": 120,
+    "settle_ms": 1500
+  },
+  "analysis": {
+    "crop": [
+      0.06,
+      0.12,
+      0.94,
+      0.92
+    ],
+    "pixel_diff_threshold": 12,
+    "stuck_mean_diff_max": 2.0,
+    "stuck_changed_ratio_max": 0.015,
+    "page_turn_mean_diff_min": 8.0,
+    "page_turn_changed_ratio_min": 0.08,
+    "bottom_confirmations": 2
+  },
+  "runtime": {
+    "loop_sleep_ms": 250,
+    "max_page_turns": 30,
+    "max_minutes": 0,
+    "debug_dir": "debug"
+  }
+}

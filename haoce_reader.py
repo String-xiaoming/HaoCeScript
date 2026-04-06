@@ -1,0 +1,729 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+import cv2
+import numpy as np
+
+
+CONTINUE_READING_TEXT = "继续阅读"
+RECENT_READING_TEXT = "最近阅读"
+PROGRESS_PREFIX = "进度:"
+
+
+def log(message: str) -> None:
+    now = time.strftime("%H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
+
+
+def parse_bounds(value: str) -> tuple[int, int, int, int]:
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", value)
+    if not match:
+        raise ValueError(f"invalid bounds: {value}")
+    x1, y1, x2, y2 = map(int, match.groups())
+    return x1, y1, x2, y2
+
+
+def center(bounds: tuple[int, int, int, int]) -> tuple[int, int]:
+    x1, y1, x2, y2 = bounds
+    return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+def area(bounds: tuple[int, int, int, int]) -> int:
+    x1, y1, x2, y2 = bounds
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def iter_nodes(node: ET.Element) -> Iterator[ET.Element]:
+    yield node
+    for child in node:
+        yield from iter_nodes(child)
+
+
+@dataclass
+class SwipeConfig:
+    start: tuple[float, float]
+    end: tuple[float, float]
+    start_jitter: tuple[float, float]
+    end_jitter: tuple[float, float]
+    duration_ms: int
+    duration_jitter_ms: int
+    settle_ms: int
+    pause_ms: int
+
+
+@dataclass
+class PageTurnConfig:
+    action: str
+    start: Optional[tuple[float, float]]
+    end: Optional[tuple[float, float]]
+    start_jitter: tuple[float, float]
+    end_jitter: tuple[float, float]
+    tap: Optional[tuple[float, float]]
+    duration_ms: int
+    duration_jitter_ms: int
+    settle_ms: int
+
+
+@dataclass
+class NavigationConfig:
+    launch_app: bool
+    open_recent_index: Optional[int]
+    auto_continue_from_report: bool
+    prepare_wait_ms: int
+
+
+@dataclass
+class AnalysisConfig:
+    crop: tuple[float, float, float, float]
+    pixel_diff_threshold: int
+    stuck_mean_diff_max: float
+    stuck_changed_ratio_max: float
+    page_turn_mean_diff_min: float
+    page_turn_changed_ratio_min: float
+    bottom_confirmations: int
+
+
+@dataclass
+class RuntimeConfig:
+    loop_sleep_ms: int
+    max_page_turns: int
+    max_minutes: int
+    debug_dir: Optional[str]
+
+
+@dataclass
+class ReaderConfig:
+    serial: Optional[str]
+    package: str
+    navigation: NavigationConfig
+    scroll: SwipeConfig
+    page_turn: PageTurnConfig
+    analysis: AnalysisConfig
+    runtime: RuntimeConfig
+
+
+@dataclass
+class DiffMetrics:
+    mean_diff: float
+    changed_ratio: float
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def load_config(path: Path) -> ReaderConfig:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    navigation = raw["navigation"]
+    scroll = raw["scroll"]
+    page_turn = raw["page_turn"]
+    analysis = raw["analysis"]
+    runtime = raw["runtime"]
+
+    return ReaderConfig(
+        serial=raw.get("serial"),
+        package=raw.get("package", "app.haoce.com"),
+        navigation=NavigationConfig(
+            launch_app=bool(navigation.get("launch_app", True)),
+            open_recent_index=navigation.get("open_recent_index"),
+            auto_continue_from_report=bool(
+                navigation.get("auto_continue_from_report", True)
+            ),
+            prepare_wait_ms=int(navigation.get("prepare_wait_ms", 2000)),
+        ),
+        scroll=SwipeConfig(
+            start=tuple(scroll["start"]),
+            end=tuple(scroll["end"]),
+            start_jitter=tuple(scroll.get("start_jitter", [0.0, 0.0])),
+            end_jitter=tuple(scroll.get("end_jitter", [0.0, 0.0])),
+            duration_ms=int(scroll["duration_ms"]),
+            duration_jitter_ms=int(scroll.get("duration_jitter_ms", 0)),
+            settle_ms=int(scroll["settle_ms"]),
+            pause_ms=int(scroll.get("pause_ms", 0)),
+        ),
+        page_turn=PageTurnConfig(
+            action=str(page_turn.get("action", "swipe")),
+            start=tuple(page_turn["start"]) if page_turn.get("start") else None,
+            end=tuple(page_turn["end"]) if page_turn.get("end") else None,
+            start_jitter=tuple(page_turn.get("start_jitter", [0.0, 0.0])),
+            end_jitter=tuple(page_turn.get("end_jitter", [0.0, 0.0])),
+            tap=tuple(page_turn["tap"]) if page_turn.get("tap") else None,
+            duration_ms=int(page_turn.get("duration_ms", 300)),
+            duration_jitter_ms=int(page_turn.get("duration_jitter_ms", 0)),
+            settle_ms=int(page_turn.get("settle_ms", 1500)),
+        ),
+        analysis=AnalysisConfig(
+            crop=tuple(analysis["crop"]),
+            pixel_diff_threshold=int(analysis.get("pixel_diff_threshold", 12)),
+            stuck_mean_diff_max=float(analysis.get("stuck_mean_diff_max", 2.0)),
+            stuck_changed_ratio_max=float(
+                analysis.get("stuck_changed_ratio_max", 0.015)
+            ),
+            page_turn_mean_diff_min=float(
+                analysis.get("page_turn_mean_diff_min", 8.0)
+            ),
+            page_turn_changed_ratio_min=float(
+                analysis.get("page_turn_changed_ratio_min", 0.08)
+            ),
+            bottom_confirmations=int(analysis.get("bottom_confirmations", 2)),
+        ),
+        runtime=RuntimeConfig(
+            loop_sleep_ms=int(runtime.get("loop_sleep_ms", 250)),
+            max_page_turns=int(runtime.get("max_page_turns", 30)),
+            max_minutes=int(runtime.get("max_minutes", 0)),
+            debug_dir=runtime.get("debug_dir"),
+        ),
+    )
+
+
+class AdbDevice:
+    def __init__(self, serial: Optional[str], package: str) -> None:
+        self.serial = serial
+        self.package = package
+
+    def _base(self) -> list[str]:
+        cmd = ["adb"]
+        if self.serial:
+            cmd.extend(["-s", self.serial])
+        return cmd
+
+    def run(
+        self,
+        *args: str,
+        capture_output: bool = True,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [*self._base(), *args],
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
+            check=check,
+        )
+
+    def shell(self, *args: str, check: bool = True) -> str:
+        result = self.run("shell", *args, check=check)
+        return result.stdout.decode("utf-8", errors="ignore").strip()
+
+    def ensure_ready(self) -> None:
+        state = self.run("get-state").stdout.decode("utf-8", errors="ignore").strip()
+        if state != "device":
+            raise RuntimeError(f"adb device state is {state!r}, expected 'device'")
+
+        package_path = self.shell("pm", "path", self.package)
+        if self.package not in package_path:
+            raise RuntimeError(f"package not found: {self.package}")
+
+    def wm_size(self) -> tuple[int, int]:
+        output = self.shell("wm", "size")
+        match = re.search(r"Physical size:\s*(\d+)x(\d+)", output)
+        if not match:
+            raise RuntimeError(f"unable to parse wm size: {output}")
+        return int(match.group(1)), int(match.group(2))
+
+    def launch_app(self) -> None:
+        self.run(
+            "shell",
+            "monkey",
+            "-p",
+            self.package,
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+        )
+
+    def tap(self, x: int, y: int) -> None:
+        self.run("shell", "input", "tap", str(x), str(y))
+
+    def swipe(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        duration_ms: int,
+    ) -> None:
+        self.run(
+            "shell",
+            "input",
+            "swipe",
+            str(start[0]),
+            str(start[1]),
+            str(end[0]),
+            str(end[1]),
+            str(duration_ms),
+        )
+
+    def capture(self) -> np.ndarray:
+        result = self.run("exec-out", "screencap", "-p")
+        buffer = np.frombuffer(result.stdout, dtype=np.uint8)
+        image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError("failed to decode screenshot")
+        return image
+
+    def dump_ui(self) -> ET.Element:
+        remote_path = "/sdcard/__haoce_ui_dump.xml"
+        self.run("shell", "uiautomator", "dump", remote_path)
+        time.sleep(0.3)
+        with tempfile.NamedTemporaryFile(
+            prefix="haoce_ui_", suffix=".xml", delete=False
+        ) as handle:
+            local_path = Path(handle.name)
+        try:
+            self.run("pull", remote_path, str(local_path))
+            content = local_path.read_text(encoding="utf-8", errors="ignore")
+            return ET.fromstring(content)
+        finally:
+            try:
+                local_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.run("shell", "rm", "-f", remote_path, check=False)
+
+
+class PageAnalyzer:
+    def __init__(self, config: AnalysisConfig) -> None:
+        self.config = config
+
+    def _crop_gray(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        left, top, right, bottom = self.config.crop
+        x1 = max(0, min(width - 1, int(width * left)))
+        y1 = max(0, min(height - 1, int(height * top)))
+        x2 = max(x1 + 1, min(width, int(width * right)))
+        y2 = max(y1 + 1, min(height, int(height * bottom)))
+        cropped = image[y1:y2, x1:x2]
+        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (360, 800), interpolation=cv2.INTER_AREA)
+
+    def diff(self, before: np.ndarray, after: np.ndarray) -> DiffMetrics:
+        a = self._crop_gray(before)
+        b = self._crop_gray(after)
+        delta = cv2.absdiff(a, b)
+        mean_diff = float(delta.mean())
+        changed_ratio = float((delta > self.config.pixel_diff_threshold).mean())
+        return DiffMetrics(mean_diff=mean_diff, changed_ratio=changed_ratio)
+
+    def looks_stuck(self, metrics: DiffMetrics) -> bool:
+        return (
+            metrics.mean_diff <= self.config.stuck_mean_diff_max
+            and metrics.changed_ratio <= self.config.stuck_changed_ratio_max
+        )
+
+    def page_turn_confirmed(self, metrics: DiffMetrics) -> bool:
+        return (
+            metrics.mean_diff >= self.config.page_turn_mean_diff_min
+            or metrics.changed_ratio >= self.config.page_turn_changed_ratio_min
+        )
+
+
+class UiNavigator:
+    def __init__(self, device: AdbDevice) -> None:
+        self.device = device
+
+    def find_clickable_text(
+        self, root: ET.Element, target: str
+    ) -> Optional[tuple[int, int, int, int]]:
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            if target not in text:
+                continue
+            bounds = node.attrib.get("bounds")
+            clickable = node.attrib.get("clickable") == "true"
+            enabled = node.attrib.get("enabled") == "true"
+            if bounds and enabled and (clickable or node.attrib.get("class", "").endswith("Button")):
+                return parse_bounds(bounds)
+        return None
+
+    def list_recent_item_bounds(self, root: ET.Element) -> list[tuple[int, int, int, int]]:
+        items: list[tuple[int, int, int, int]] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for node in iter_nodes(root):
+            bounds_text = node.attrib.get("bounds")
+            if not bounds_text:
+                continue
+            direct_children = list(node)
+            if not direct_children:
+                continue
+            has_progress = any(
+                (child.attrib.get("text") or "").startswith(PROGRESS_PREFIX)
+                for child in direct_children
+            )
+            if not has_progress:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) < 15000:
+                continue
+            if bounds not in seen:
+                items.append(bounds)
+                seen.add(bounds)
+        items.sort(key=lambda item: (item[1], item[0]))
+        return items
+
+    def inspect(self) -> dict[str, object]:
+        root = self.device.dump_ui()
+        texts = [(node.attrib.get("text") or "").strip() for node in iter_nodes(root)]
+        return {
+            "has_continue_button": self.find_clickable_text(root, CONTINUE_READING_TEXT)
+            is not None,
+            "has_recent_reading": RECENT_READING_TEXT in texts,
+            "recent_items": len(self.list_recent_item_bounds(root)),
+        }
+
+    def prepare_reading_page(self, config: NavigationConfig) -> str:
+        root = self.device.dump_ui()
+
+        if config.auto_continue_from_report:
+            button = self.find_clickable_text(root, CONTINUE_READING_TEXT)
+            if button:
+                x, y = center(button)
+                log(f"found '{CONTINUE_READING_TEXT}', tapping {x},{y}")
+                self.device.tap(x, y)
+                return "continue"
+
+        if config.open_recent_index and config.open_recent_index > 0:
+            items = self.list_recent_item_bounds(root)
+            if items and len(items) >= config.open_recent_index:
+                bounds = items[config.open_recent_index - 1]
+                x, y = center(bounds)
+                log(
+                    f"opening recent book #{config.open_recent_index} at {x},{y}"
+                )
+                self.device.tap(x, y)
+                time.sleep(config.prepare_wait_ms / 1000)
+
+                if config.auto_continue_from_report:
+                    root = self.device.dump_ui()
+                    button = self.find_clickable_text(root, CONTINUE_READING_TEXT)
+                    if button:
+                        x, y = center(button)
+                        log(f"found '{CONTINUE_READING_TEXT}', tapping {x},{y}")
+                        self.device.tap(x, y)
+                        return "open_recent_then_continue"
+                return "open_recent"
+
+        return "noop"
+
+
+class HaoceReader:
+    def __init__(self, config: ReaderConfig) -> None:
+        self.config = config
+        self.device = AdbDevice(config.serial, config.package)
+        self.navigator = UiNavigator(self.device)
+        self.analyzer = PageAnalyzer(config.analysis)
+        self.screen_size = (0, 0)
+        self.debug_dir = (
+            Path(config.runtime.debug_dir).resolve()
+            if config.runtime.debug_dir
+            else None
+        )
+
+    def _ratio_to_abs(self, point: tuple[float, float]) -> tuple[int, int]:
+        if self.screen_size == (0, 0):
+            self.screen_size = self.device.wm_size()
+        width, height = self.screen_size
+        return int(width * point[0]), int(height * point[1])
+
+    def _clamp_point(self, point: tuple[int, int]) -> tuple[int, int]:
+        if self.screen_size == (0, 0):
+            self.screen_size = self.device.wm_size()
+        width, height = self.screen_size
+        x = max(0, min(width - 1, point[0]))
+        y = max(0, min(height - 1, point[1]))
+        return x, y
+
+    def _randomized_point(
+        self,
+        point: tuple[float, float],
+        jitter: tuple[float, float],
+    ) -> tuple[int, int]:
+        x = point[0] + random.uniform(-jitter[0], jitter[0])
+        y = point[1] + random.uniform(-jitter[1], jitter[1])
+        return self._clamp_point(self._ratio_to_abs((x, y)))
+
+    def _randomized_duration(self, duration_ms: int, jitter_ms: int) -> int:
+        if jitter_ms <= 0:
+            return duration_ms
+        return max(1, duration_ms + random.randint(-jitter_ms, jitter_ms))
+
+    def _sleep_ms(self, delay_ms: int) -> None:
+        if delay_ms <= 0:
+            return
+        time.sleep(delay_ms / 1000)
+
+    def _save_debug(self, name: str, image: np.ndarray) -> None:
+        if not self.debug_dir:
+            return
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        path = self.debug_dir / name
+        cv2.imwrite(str(path), image)
+
+    def doctor(self) -> int:
+        self.device.ensure_ready()
+        self.screen_size = self.device.wm_size()
+        info = self.navigator.inspect()
+        print(
+            json.dumps(
+                {
+                    "serial": self.config.serial,
+                    "package": self.config.package,
+                    "screen_size": {
+                        "width": self.screen_size[0],
+                        "height": self.screen_size[1],
+                    },
+                    "ui": info,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    def dump_ui(self, output: Path) -> int:
+        root = self.device.dump_ui()
+        output.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
+        log(f"ui dump saved to {output}")
+        return 0
+
+    def capture(self, output: Path) -> int:
+        self.device.ensure_ready()
+        image = self.device.capture()
+        cv2.imwrite(str(output), image)
+        log(f"screenshot saved to {output}")
+        return 0
+
+    def prepare(self, skip_prepare: bool = False) -> None:
+        self.device.ensure_ready()
+        self.screen_size = self.device.wm_size()
+        if self.config.navigation.launch_app:
+            log(f"launching {self.config.package}")
+            self.device.launch_app()
+            time.sleep(self.config.navigation.prepare_wait_ms / 1000)
+        if not skip_prepare:
+            result = self.navigator.prepare_reading_page(self.config.navigation)
+            if result != "noop":
+                time.sleep(self.config.navigation.prepare_wait_ms / 1000)
+            log(f"prepare result: {result}")
+
+    def perform_scroll(self) -> None:
+        start = self._randomized_point(
+            self.config.scroll.start,
+            self.config.scroll.start_jitter,
+        )
+        end = self._randomized_point(
+            self.config.scroll.end,
+            self.config.scroll.end_jitter,
+        )
+        duration_ms = self._randomized_duration(
+            self.config.scroll.duration_ms,
+            self.config.scroll.duration_jitter_ms,
+        )
+        log(
+            "scroll swipe: start=({0},{1}) end=({2},{3}) duration={4}ms".format(
+                start[0], start[1], end[0], end[1], duration_ms
+            )
+        )
+        self.device.swipe(start, end, duration_ms)
+
+    def perform_page_turn(self) -> None:
+        action = self.config.page_turn.action.lower()
+        if action == "tap":
+            if not self.config.page_turn.tap:
+                raise ConfigError("page_turn.tap is required when action='tap'")
+            x, y = self._ratio_to_abs(self.config.page_turn.tap)
+            self.device.tap(x, y)
+            return
+
+        if action != "swipe":
+            raise ConfigError(f"unsupported page_turn.action: {self.config.page_turn.action}")
+        if not self.config.page_turn.start or not self.config.page_turn.end:
+            raise ConfigError("page_turn.start/end are required when action='swipe'")
+        start = self._randomized_point(
+            self.config.page_turn.start,
+            self.config.page_turn.start_jitter,
+        )
+        end = self._randomized_point(
+            self.config.page_turn.end,
+            self.config.page_turn.end_jitter,
+        )
+        duration_ms = self._randomized_duration(
+            self.config.page_turn.duration_ms,
+            self.config.page_turn.duration_jitter_ms,
+        )
+        log(
+            "page-turn swipe: start=({0},{1}) end=({2},{3}) duration={4}ms".format(
+                start[0], start[1], end[0], end[1], duration_ms
+            )
+        )
+        self.device.swipe(start, end, duration_ms)
+
+    def run(
+        self,
+        skip_prepare: bool = False,
+        max_page_turns_override: Optional[int] = None,
+    ) -> int:
+        self.prepare(skip_prepare=skip_prepare)
+
+        max_page_turns = (
+            max_page_turns_override
+            if max_page_turns_override is not None
+            else self.config.runtime.max_page_turns
+        )
+        start_time = time.monotonic()
+        page_turns = 0
+        stuck_count = 0
+        iteration = 0
+
+        log("reader loop started")
+        while True:
+            iteration += 1
+            pause_after_page_turn = False
+            before = self.device.capture()
+            self.perform_scroll()
+            self._sleep_ms(self.config.scroll.settle_ms)
+            after = self.device.capture()
+
+            metrics = self.analyzer.diff(before, after)
+            log(
+                "scroll #{0}: mean_diff={1:.3f}, changed_ratio={2:.4f}".format(
+                    iteration, metrics.mean_diff, metrics.changed_ratio
+                )
+            )
+
+            if self.analyzer.looks_stuck(metrics):
+                stuck_count += 1
+                log(
+                    f"bottom-like state {stuck_count}/{self.config.analysis.bottom_confirmations}"
+                )
+                if stuck_count < self.config.analysis.bottom_confirmations:
+                    self._sleep_ms(self.config.runtime.loop_sleep_ms)
+                    continue
+
+                before_turn = self.device.capture()
+                self.perform_page_turn()
+                self._sleep_ms(self.config.page_turn.settle_ms)
+                after_turn = self.device.capture()
+
+                turn_metrics = self.analyzer.diff(before_turn, after_turn)
+                log(
+                    "page-turn check: mean_diff={0:.3f}, changed_ratio={1:.4f}".format(
+                        turn_metrics.mean_diff,
+                        turn_metrics.changed_ratio,
+                    )
+                )
+
+                if self.analyzer.page_turn_confirmed(turn_metrics):
+                    page_turns += 1
+                    stuck_count = 0
+                    pause_after_page_turn = True
+                    log(f"moved to next section, total page turns: {page_turns}")
+                else:
+                    self._save_debug("turn_before.png", before_turn)
+                    self._save_debug("turn_after.png", after_turn)
+                    log("page turn not confirmed, stopping to avoid misfire")
+                    return 2
+            else:
+                stuck_count = 0
+                if self.config.scroll.pause_ms > 0:
+                    log(
+                        f"scroll pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
+                    )
+                self._sleep_ms(self.config.scroll.pause_ms)
+
+            if max_page_turns > 0 and page_turns >= max_page_turns:
+                log(f"reached max_page_turns={max_page_turns}, stopping")
+                return 0
+
+            if self.config.runtime.max_minutes > 0:
+                elapsed_minutes = (time.monotonic() - start_time) / 60
+                if elapsed_minutes >= self.config.runtime.max_minutes:
+                    log(
+                        f"reached max_minutes={self.config.runtime.max_minutes}, stopping"
+                    )
+                    return 0
+
+            if pause_after_page_turn and self.config.scroll.pause_ms > 0:
+                log(
+                    f"page-turn pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
+                )
+                self._sleep_ms(self.config.scroll.pause_ms)
+
+            self._sleep_ms(self.config.runtime.loop_sleep_ms)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="ADB-based Haoce reader with bottom detection and auto page turn."
+    )
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="Path to JSON config file. Default: config.json",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("doctor", help="Check ADB/device/package/UI state.")
+
+    dump_ui = subparsers.add_parser("dump-ui", help="Dump current UI XML.")
+    dump_ui.add_argument("output", help="Output XML file path.")
+
+    capture = subparsers.add_parser("capture", help="Save current screenshot.")
+    capture.add_argument("output", help="Output PNG file path.")
+
+    run_parser = subparsers.add_parser("run", help="Start auto reading loop.")
+    run_parser.add_argument(
+        "--skip-prepare",
+        action="store_true",
+        help="Skip home/report-page navigation and start from current page.",
+    )
+    run_parser.add_argument(
+        "--max-page-turns",
+        type=int,
+        default=None,
+        help="Override max_page_turns from config. Use 0 for unlimited.",
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    config = load_config(Path(args.config))
+    reader = HaoceReader(config)
+
+    if args.command == "doctor":
+        return reader.doctor()
+    if args.command == "dump-ui":
+        return reader.dump_ui(Path(args.output))
+    if args.command == "capture":
+        return reader.capture(Path(args.output))
+    if args.command == "run":
+        return reader.run(
+            skip_prepare=args.skip_prepare,
+            max_page_turns_override=args.max_page_turns,
+        )
+
+    parser.error(f"unsupported command: {args.command}")
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        log("stopped by user")
+        raise SystemExit(130)
