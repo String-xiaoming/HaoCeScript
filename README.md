@@ -1,107 +1,208 @@
-# Haoce Auto Reader
+# 好策自动阅读脚本使用说明
 
-This project drives `app.haoce.com` through ADB and uses screenshot-difference
-detection to decide whether the current chapter has reached the bottom.
+## 文件说明
 
-## What it does
+- [start.bat](/E:/haoce/start.bat)
+  - 一键启动脚本，直接双击即可。
+- [haoce_reader.py](/E:/haoce/haoce_reader.py)
+  - 主程序，负责 ADB 控制、截图识别、到底检测和自动翻页。
+- [config.json](/E:/haoce/config.json)
+  - 配置文件，改这里可以适配不同书籍或翻页方式。
+- [requirements.txt](/E:/haoce/requirements.txt)
+  - Python 依赖列表。
 
-- Launches Haoce through ADB.
-- Optionally opens the first item in `最近阅读`.
-- If it lands on the stats/report page, it automatically taps `继续阅读`.
-- Scrolls vertically inside the current chapter.
-- Detects "cannot scroll further" from screenshot differences.
-- When bottom is confirmed, swipes left to enter the next section/chapter.
+## 最简单的用法
 
-The default config was tuned on a `1080x2400` device and validated against the
-real behavior of `专利笔记`: vertical reading page, bottom reached when upward
-swipes stop moving, then a left swipe enters the next section.
+1. 手机打开 USB 调试，并确保已经允许这台电脑的 ADB 调试。
+2. 用数据线连上手机。
+3. 确认手机里已经安装好策，包名是 `app.haoce.com`。
+4. 双击 [start.bat](/E:/haoce/start.bat)。
 
-## Install
+脚本会自动做这几件事：
 
-```powershell
-pip install -r requirements.txt
-```
+- 检查 `python` 和 `adb` 是否可用。
+- 自动安装依赖。
+- 检查手机是否连接成功、好策是否已安装。
+- 自动启动好策。
+- 如果当前在“阅读报告/章节完结情况”页，会自动点“继续阅读”。
+- 进入正文后自动上滑。
+- 识别滑到底部后自动左滑到下一节。
 
-ADB must already be available in `PATH`.
+## 当前默认逻辑
 
-## Commands
+这套默认配置已经按你当前设备实测通过：
 
-Check connection, package, screen size, and whether the current UI contains
-`继续阅读` or `最近阅读`:
+- 设备分辨率：`1080x2400`
+- App：`app.haoce.com`
+- 正文页：竖向滚动
+- 到底判断：连续两次上滑后画面几乎不变化
+- 翻页方式：到底后左滑进入下一节
 
-```powershell
-python haoce_reader.py --config config.json doctor
-```
+如果别的书也是这个模式，直接用就行。
 
-Save current screenshot:
+## 常用命令
 
-```powershell
-python haoce_reader.py --config config.json capture current.png
-```
-
-Save current UI XML:
-
-```powershell
-python haoce_reader.py --config config.json dump-ui current.xml
-```
-
-Run the reader loop:
+如果你想手动从命令行启动，可以在当前目录执行：
 
 ```powershell
 python haoce_reader.py --config config.json run
 ```
 
-Run from the current page without trying to open `最近阅读` or tapping
-`继续阅读`:
+如果你已经手动进入正文页，不想让脚本自动点“最近阅读”或“继续阅读”，可以执行：
 
 ```powershell
 python haoce_reader.py --config config.json run --skip-prepare
 ```
 
-Limit the number of chapter/page turns:
+检查设备状态：
 
 ```powershell
-python haoce_reader.py --config config.json run --max-page-turns 20
+python haoce_reader.py --config config.json doctor
 ```
 
-## Config Notes
+保存当前截图：
 
-`config.json` contains the important knobs:
+```powershell
+python haoce_reader.py --config config.json capture current.png
+```
 
-- `navigation.open_recent_index`
-  - `1` means open the first item under `最近阅读`.
-  - `null` or `0` means do not auto-open a recent book.
-- `scroll`
-  - Controls the vertical swipe used inside one chapter.
-  - `pause_ms` is the dwell time after each normal upward swipe. Set to
-    `15000` to stay 15 seconds before the next reading scroll.
-  - When the bottom is being confirmed or a page turn is about to happen, the
-    script does not wait for `pause_ms`.
-  - After a page turn is confirmed, the script waits for `pause_ms` before the
-    first upward swipe in the new section.
-  - `start_jitter` / `end_jitter` and `duration_jitter_ms` add small random
-    offsets so each swipe path is a bit different.
-- `page_turn`
-  - Default action is a left swipe for the next section.
-  - `start_jitter` / `end_jitter` and `duration_jitter_ms` can randomize the
-    horizontal page-turn swipe as well.
-  - If a different book needs tapping instead of swiping, set
-    `"action": "tap"` and fill `tap`.
-- `analysis`
-  - `stuck_*` thresholds decide whether the screen is effectively not moving.
-  - `page_turn_*` thresholds decide whether the next section really loaded.
-- `runtime.max_page_turns`
-  - `0` means unlimited.
+导出当前界面结构：
 
-## If A Book Behaves Differently
+```powershell
+python haoce_reader.py --config config.json dump-ui current.xml
+```
 
-Some Haoce books can use different reading layouts. When that happens:
+## 如何停止
 
-1. Open the target book manually.
-2. Use `capture` and `dump-ui` to inspect the page.
-3. Adjust `scroll` and `page_turn` coordinates in `config.json`.
-4. If the bottom detection is too sensitive or too loose, tune the values in
-   `analysis`.
+- 如果是双击 [start.bat](/E:/haoce/start.bat) 运行的，窗口运行时按 `Ctrl + C`。
+- 如果手机已经停在某一页，不会继续自动操作，直接关闭命令窗口也可以。
 
-If a page turn cannot be confirmed, the script stops and saves screenshots into
-`debug/` so you can inspect what happened.
+## 配置怎么改
+
+主要改 [config.json](/E:/haoce/config.json)。
+
+### 1. 切换要打开的最近阅读书籍
+
+`navigation.open_recent_index`
+
+- `1` 表示打开“最近阅读”的第 1 本书
+- `2` 表示第 2 本
+- `null` 或 `0` 表示不自动点最近阅读
+
+### 2. 调整正文滚动动作
+
+`scroll.start` 和 `scroll.end`
+
+- 这是相对坐标，不是固定像素
+- 比如 `[0.5, 0.8]` 表示屏幕中间偏下
+- 如果上滑太短，可以把 `start` 调低一点、`end` 调高一点
+
+### 3. 调整翻页动作
+
+`page_turn`
+
+- 现在默认是：
+  - 到底后从右往左滑一下
+- 如果某本书是点击翻页：
+  - 把 `"action"` 改成 `"tap"`
+  - 再填写 `tap`
+
+例如：
+
+```json
+"page_turn": {
+  "action": "tap",
+  "start": null,
+  "end": null,
+  "tap": [0.85, 0.5],
+  "duration_ms": 300,
+  "settle_ms": 1500
+}
+```
+
+### 4. 调整到底识别灵敏度
+
+`analysis`
+
+- `stuck_mean_diff_max`
+  - 越大越容易判定“到底了”
+- `stuck_changed_ratio_max`
+  - 越大越容易判定“到底了”
+- `bottom_confirmations`
+  - 建议保留 `2`
+  - 数字越大越稳，但翻页会更慢一点
+
+## 常见问题
+
+### 1. 双击 `start.bat` 没反应
+
+先确认：
+
+- 安装了 Python
+- 安装了 ADB
+- 两者都已经加入 `PATH`
+
+命令行里能执行这两个命令才行：
+
+```powershell
+python --version
+adb version
+```
+
+### 2. 提示没有设备
+
+先执行：
+
+```powershell
+adb devices
+```
+
+如果设备显示 `unauthorized`：
+
+- 看手机弹窗
+- 点允许 USB 调试
+
+### 3. 能滑动，但翻不到下一节
+
+说明这本书的翻页方式可能不是“左滑下一节”。
+
+这时你可以给我这些信息，我可以继续帮你适配：
+
+- 正文页截图
+- 滑到底部后的截图
+- 你手动翻到下一节时的动作
+  - 是左滑
+  - 右滑
+  - 点右侧
+  - 点按钮
+- 如果能提供一份 `dump-ui` 导出的 XML，会更快
+
+### 4. 脚本误判到底，翻页太早
+
+可以把 [config.json](/E:/haoce/config.json) 里这两个值调小一些：
+
+```json
+"stuck_mean_diff_max": 1.2,
+"stuck_changed_ratio_max": 0.008
+```
+
+### 5. 脚本到了底部却一直不翻页
+
+可以把这两个值调大一些：
+
+```json
+"stuck_mean_diff_max": 3.0,
+"stuck_changed_ratio_max": 0.02
+```
+
+## 现在推荐的启动方式
+
+平时直接双击 [start.bat](/E:/haoce/start.bat) 就够了。
+
+如果后面你想继续扩展，我可以再给你补这些功能：
+
+- 多本书不同配置自动切换
+- OCR 识别章节标题
+- 自动统计阅读时长
+- 日志保存到文件
+- 失败后自动重试
