@@ -24,10 +24,16 @@
       0.03,
       0.025
     ],
-    "duration_ms": 520,
-    "duration_jitter_ms": 180,
+    "duration_ms": [
+      450,
+      650
+    ],
+    "duration_jitter_ms": 0,
     "settle_ms": 1200,
-    "pause_ms": 13000
+    "pause_ms": [
+      10000,
+      15000
+    ]
   },
   "page_turn": {
     "action": "swipe",

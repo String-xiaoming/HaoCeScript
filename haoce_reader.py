@@ -63,10 +63,10 @@ class SwipeConfig:
     end: tuple[float, float]
     start_jitter: tuple[float, float]
     end_jitter: tuple[float, float]
-    duration_ms: int
+    duration_ms: tuple[int, int]
     duration_jitter_ms: int
     settle_ms: int
-    pause_ms: int
+    pause_ms: tuple[int, int]
 
 
 @dataclass
@@ -77,7 +77,7 @@ class PageTurnConfig:
     start_jitter: tuple[float, float]
     end_jitter: tuple[float, float]
     tap: Optional[tuple[float, float]]
-    duration_ms: int
+    duration_ms: tuple[int, int]
     duration_jitter_ms: int
     settle_ms: int
 
@@ -155,6 +155,25 @@ def parse_progress_percent(value: str) -> Optional[float]:
     return float(match.group(1))
 
 
+def parse_int_range(value: object, name: str) -> tuple[int, int]:
+    if isinstance(value, (int, float)):
+        parsed = int(value)
+        if parsed < 0:
+            raise ConfigError(f"{name} must be >= 0")
+        return parsed, parsed
+
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        start = int(value[0])
+        end = int(value[1])
+        low = min(start, end)
+        high = max(start, end)
+        if low < 0:
+            raise ConfigError(f"{name} values must be >= 0")
+        return low, high
+
+    raise ConfigError(f"{name} must be an integer or a 2-item range")
+
+
 def load_config(path: Path) -> ReaderConfig:
     raw = json.loads(path.read_text(encoding="utf-8"))
 
@@ -180,10 +199,10 @@ def load_config(path: Path) -> ReaderConfig:
             end=tuple(scroll["end"]),
             start_jitter=tuple(scroll.get("start_jitter", [0.0, 0.0])),
             end_jitter=tuple(scroll.get("end_jitter", [0.0, 0.0])),
-            duration_ms=int(scroll["duration_ms"]),
+            duration_ms=parse_int_range(scroll["duration_ms"], "scroll.duration_ms"),
             duration_jitter_ms=int(scroll.get("duration_jitter_ms", 0)),
             settle_ms=int(scroll["settle_ms"]),
-            pause_ms=int(scroll.get("pause_ms", 0)),
+            pause_ms=parse_int_range(scroll.get("pause_ms", 0), "scroll.pause_ms"),
         ),
         page_turn=PageTurnConfig(
             action=str(page_turn.get("action", "swipe")),
@@ -192,7 +211,10 @@ def load_config(path: Path) -> ReaderConfig:
             start_jitter=tuple(page_turn.get("start_jitter", [0.0, 0.0])),
             end_jitter=tuple(page_turn.get("end_jitter", [0.0, 0.0])),
             tap=tuple(page_turn["tap"]) if page_turn.get("tap") else None,
-            duration_ms=int(page_turn.get("duration_ms", 300)),
+            duration_ms=parse_int_range(
+                page_turn.get("duration_ms", 300),
+                "page_turn.duration_ms",
+            ),
             duration_jitter_ms=int(page_turn.get("duration_jitter_ms", 0)),
             settle_ms=int(page_turn.get("settle_ms", 1500)),
         ),
@@ -762,15 +784,44 @@ class HaoceReader:
         y = point[1] + random.uniform(-jitter[1], jitter[1])
         return self._clamp_point(self._ratio_to_abs((x, y)))
 
-    def _randomized_duration(self, duration_ms: int, jitter_ms: int) -> int:
+    def _randomized_duration(
+        self,
+        duration_ms: tuple[int, int],
+        jitter_ms: int,
+    ) -> int:
+        low, high = duration_ms
+        base_duration = low if low == high else random.randint(low, high)
         if jitter_ms <= 0:
-            return duration_ms
-        return max(1, duration_ms + random.randint(-jitter_ms, jitter_ms))
+            return base_duration
+        return max(1, base_duration + random.randint(-jitter_ms, jitter_ms))
 
     def _sleep_ms(self, delay_ms: int) -> None:
         if delay_ms <= 0:
             return
         time.sleep(delay_ms / 1000)
+
+    def _random_pause_ms(self) -> int:
+        low, high = self.config.scroll.pause_ms
+        if high <= 0:
+            return 0
+        if low == high:
+            return low
+        return random.randint(low, high)
+
+    def _sleep_scroll_pause(self, label: str) -> None:
+        pause_ms = self._random_pause_ms()
+        if pause_ms <= 0:
+            return
+
+        low, high = self.config.scroll.pause_ms
+        if low == high:
+            log(f"{label}: waiting {pause_ms}ms before next upward swipe")
+        else:
+            log(
+                f"{label}: waiting {pause_ms}ms before next upward swipe "
+                f"(random in {low}-{high}ms)"
+            )
+        self._sleep_ms(pause_ms)
 
     def _swipe_ratio(
         self,
@@ -1295,11 +1346,7 @@ class HaoceReader:
                         return 2
             else:
                 stuck_count = 0
-                if self.config.scroll.pause_ms > 0:
-                    log(
-                        f"scroll pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
-                    )
-                self._sleep_ms(self.config.scroll.pause_ms)
+                self._sleep_scroll_pause("scroll pause")
 
             if max_page_turns > 0 and page_turns >= max_page_turns:
                 log(f"reached max_page_turns={max_page_turns}, stopping")
@@ -1313,17 +1360,11 @@ class HaoceReader:
                     )
                     return 0
 
-            if pause_after_page_turn and self.config.scroll.pause_ms > 0:
-                log(
-                    f"page-turn pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
-                )
-                self._sleep_ms(self.config.scroll.pause_ms)
+            if pause_after_page_turn:
+                self._sleep_scroll_pause("page-turn pause")
 
-            if pause_after_book_switch and self.config.scroll.pause_ms > 0:
-                log(
-                    f"book-switch pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
-                )
-                self._sleep_ms(self.config.scroll.pause_ms)
+            if pause_after_book_switch:
+                self._sleep_scroll_pause("book-switch pause")
 
             self._sleep_ms(self.config.runtime.loop_sleep_ms)
 
