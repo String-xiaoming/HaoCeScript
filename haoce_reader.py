@@ -24,7 +24,13 @@ PROGRESS_PREFIX = "进度:"
 
 def log(message: str) -> None:
     now = time.strftime("%H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+    line = f"[{now}] {message}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        safe_line = line.encode(encoding, errors="backslashreplace").decode(encoding)
+        print(safe_line, flush=True)
 
 
 def parse_bounds(value: str) -> tuple[int, int, int, int]:
@@ -120,8 +126,33 @@ class DiffMetrics:
     changed_ratio: float
 
 
+@dataclass(frozen=True)
+class RecentBook:
+    title: str
+    image_key: Optional[str]
+    progress_text: str
+    progress_percent: Optional[float]
+    bounds: tuple[int, int, int, int]
+
+    @property
+    def key(self) -> str:
+        if self.image_key:
+            return self.image_key
+        return f"{self.title}:{self.bounds}"
+
+    def is_complete(self, threshold: float = 99.9) -> bool:
+        return self.progress_percent is not None and self.progress_percent >= threshold
+
+
 class ConfigError(RuntimeError):
     pass
+
+
+def parse_progress_percent(value: str) -> Optional[float]:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*%", value)
+    if not match:
+        return None
+    return float(match.group(1))
 
 
 def load_config(path: Path) -> ReaderConfig:
@@ -247,6 +278,9 @@ class AdbDevice:
     def tap(self, x: int, y: int) -> None:
         self.run("shell", "input", "tap", str(x), str(y))
 
+    def back(self) -> None:
+        self.run("shell", "input", "keyevent", "4")
+
     def swipe(
         self,
         start: tuple[int, int],
@@ -274,8 +308,19 @@ class AdbDevice:
 
     def dump_ui(self) -> ET.Element:
         remote_path = "/sdcard/__haoce_ui_dump.xml"
-        self.run("shell", "uiautomator", "dump", remote_path)
-        time.sleep(0.3)
+        last_error: Optional[subprocess.CalledProcessError] = None
+        for attempt in range(3):
+            try:
+                self.run("shell", "uiautomator", "dump", remote_path)
+                time.sleep(0.3)
+                break
+            except subprocess.CalledProcessError as exc:
+                last_error = exc
+                time.sleep(0.5)
+        else:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("uiautomator dump failed without an error")
         with tempfile.NamedTemporaryFile(
             prefix="haoce_ui_", suffix=".xml", delete=False
         ) as handle:
@@ -332,6 +377,143 @@ class UiNavigator:
     def __init__(self, device: AdbDevice) -> None:
         self.device = device
 
+    def _current_page_name(self, root: ET.Element) -> Optional[str]:
+        anchors = {
+            "校图书读书工程": "collection",
+            "首页": "home",
+            "成绩": "report",
+        }
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            page_name = anchors.get(text)
+            if page_name:
+                return page_name
+        return None
+
+    def _page_subtree(self, root: ET.Element, page_name: str) -> Optional[ET.Element]:
+        if self._current_page_name(root) != page_name:
+            return None
+
+        anchors = {
+            "collection": "校图书读书工程",
+            "home": "首页",
+            "report": "成绩",
+        }
+        target = anchors[page_name]
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            if text == target:
+                return node
+        return None
+
+    def report_title(self, root: ET.Element) -> Optional[str]:
+        subtree = self._page_subtree(root, "report")
+        if subtree is None:
+            return None
+
+        best_text = None
+        best_y = None
+        for node in iter_nodes(subtree):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text or not bounds_text or text in {"返回", "读书报告", "继续阅读", "成绩"}:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            if bounds[1] > 260:
+                continue
+            if best_y is None or bounds[1] < best_y:
+                best_text = text
+                best_y = bounds[1]
+        return best_text
+
+    def report_progress(self, root: ET.Element) -> Optional[float]:
+        subtree = self._page_subtree(root, "report")
+        if subtree is None:
+            return None
+
+        best = None
+        best_y = None
+        for node in iter_nodes(subtree):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text or not bounds_text or "%" not in text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            if not (300 <= bounds[1] <= 700):
+                continue
+            if bounds[0] > 650:
+                continue
+            value = parse_progress_percent(text)
+            if value is None:
+                continue
+            if best_y is None or bounds[1] < best_y:
+                best = value
+                best_y = bounds[1]
+        return best
+
+    def find_text_bounds(
+        self,
+        root: ET.Element,
+        target: str,
+    ) -> Optional[tuple[int, int, int, int]]:
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if text != target or not bounds_text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            return bounds
+        return None
+
+    def detail_title(self, root: ET.Element) -> Optional[str]:
+        start_bounds = self.find_text_bounds(root, "开始阅读")
+        if not start_bounds:
+            return None
+
+        best_text = None
+        best_area = -1
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text or not bounds_text or text in {"返回", "书香理工", "开始阅读"}:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            if not (220 <= bounds[1] <= 500):
+                continue
+            current_area = area(bounds)
+            if current_area > best_area:
+                best_text = text
+                best_area = current_area
+        return best_text
+
+    def detail_progress(self, root: ET.Element) -> Optional[float]:
+        start_bounds = self.find_text_bounds(root, "开始阅读")
+        if not start_bounds:
+            return None
+
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text or not bounds_text or "%" not in text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) == 0:
+                continue
+            if not (1100 <= bounds[1] <= 1450):
+                continue
+            value = parse_progress_percent(text)
+            if value is not None:
+                return value
+        return None
+
     def find_clickable_text(
         self, root: ET.Element, target: str
     ) -> Optional[tuple[int, int, int, int]]:
@@ -346,29 +528,155 @@ class UiNavigator:
                 return parse_bounds(bounds)
         return None
 
-    def list_recent_item_bounds(self, root: ET.Element) -> list[tuple[int, int, int, int]]:
-        items: list[tuple[int, int, int, int]] = []
+    def list_recent_books(self, root: ET.Element) -> list[RecentBook]:
+        items: list[RecentBook] = []
         seen: set[tuple[int, int, int, int]] = set()
-        for node in iter_nodes(root):
+        subtree = self._page_subtree(root, "home")
+        if subtree is None:
+            return []
+
+        for node in iter_nodes(subtree):
             bounds_text = node.attrib.get("bounds")
             if not bounds_text:
                 continue
             direct_children = list(node)
             if not direct_children:
                 continue
-            has_progress = any(
-                (child.attrib.get("text") or "").startswith(PROGRESS_PREFIX)
-                for child in direct_children
-            )
-            if not has_progress:
+            progress_text = None
+            title = ""
+            image_key = None
+            for child in direct_children:
+                text = (child.attrib.get("text") or "").strip()
+                if not text:
+                    continue
+                if text.startswith(PROGRESS_PREFIX):
+                    progress_text = text
+                    continue
+                child_class = child.attrib.get("class", "")
+                if "Image" in child_class and image_key is None:
+                    image_key = text
+                    continue
+                if not title:
+                    title = text
+
+            if not progress_text:
                 continue
             bounds = parse_bounds(bounds_text)
             if area(bounds) < 15000:
                 continue
             if bounds not in seen:
-                items.append(bounds)
+                items.append(
+                    RecentBook(
+                        title=title,
+                        image_key=image_key,
+                        progress_text=progress_text,
+                        progress_percent=parse_progress_percent(progress_text),
+                        bounds=bounds,
+                    )
+                )
                 seen.add(bounds)
-        items.sort(key=lambda item: (item[1], item[0]))
+        items.sort(key=lambda item: (item.bounds[1], item.bounds[0]))
+        return items
+
+    def list_recent_item_bounds(self, root: ET.Element) -> list[tuple[int, int, int, int]]:
+        return [item.bounds for item in self.list_recent_books(root)]
+
+    def find_recent_book_by_key(
+        self,
+        root: ET.Element,
+        key: str,
+    ) -> Optional[RecentBook]:
+        for item in self.list_recent_books(root):
+            if item.key == key:
+                return item
+        return None
+
+    def first_unfinished_recent_book(
+        self,
+        root: ET.Element,
+        exclude_keys: Optional[set[str]] = None,
+    ) -> Optional[RecentBook]:
+        excluded = exclude_keys or set()
+        for item in self.list_recent_books(root):
+            if item.key in excluded:
+                continue
+            if not item.is_complete():
+                return item
+        return None
+
+    def find_home_collection_entry(self, root: ET.Element) -> Optional[tuple[int, int, int, int]]:
+        subtree = self._page_subtree(root, "home")
+        if subtree is None:
+            return None
+
+        candidates: list[tuple[int, int, int, int]] = []
+        for node in iter_nodes(subtree):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if text != "书香理工" or not bounds_text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if bounds[1] < 1100:
+                candidates.append(bounds)
+
+        if not candidates:
+            return None
+
+        x1, y1, x2, y2 = min(candidates, key=lambda item: (item[1], item[0]))
+        return max(0, x1 - 24), max(0, y1 - 180), x2 + 24, y2 + 24
+
+    def list_collection_books(self, root: ET.Element) -> list[RecentBook]:
+        items: list[RecentBook] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        subtree = self._page_subtree(root, "collection")
+        if subtree is None:
+            return []
+
+        for node in iter_nodes(subtree):
+            bounds_text = node.attrib.get("bounds")
+            if not bounds_text:
+                continue
+            direct_children = list(node)
+            if not direct_children:
+                continue
+
+            progress_text = None
+            title = ""
+            image_key = None
+            for child in direct_children:
+                text = (child.attrib.get("text") or "").strip()
+                if not text:
+                    continue
+                if "进度" in text or "讲度" in text:
+                    progress_text = text
+                    continue
+                child_class = child.attrib.get("class", "")
+                if "Image" in child_class and image_key is None:
+                    image_key = text
+                    continue
+                if text != "• " and not title:
+                    title = text
+
+            if not progress_text or not title:
+                continue
+
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) < 60000:
+                continue
+
+            if bounds not in seen:
+                items.append(
+                    RecentBook(
+                        title=title,
+                        image_key=image_key,
+                        progress_text=progress_text,
+                        progress_percent=parse_progress_percent(progress_text),
+                        bounds=bounds,
+                    )
+                )
+                seen.add(bounds)
+
+        items.sort(key=lambda item: (item.bounds[1], item.bounds[0]))
         return items
 
     def inspect(self) -> dict[str, object]:
@@ -393,10 +701,10 @@ class UiNavigator:
                 return "continue"
 
         if config.open_recent_index and config.open_recent_index > 0:
-            items = self.list_recent_item_bounds(root)
+            items = self.list_recent_books(root)
             if items and len(items) >= config.open_recent_index:
-                bounds = items[config.open_recent_index - 1]
-                x, y = center(bounds)
+                book = items[config.open_recent_index - 1]
+                x, y = center(book.bounds)
                 log(
                     f"opening recent book #{config.open_recent_index} at {x},{y}"
                 )
@@ -423,6 +731,8 @@ class HaoceReader:
         self.navigator = UiNavigator(self.device)
         self.analyzer = PageAnalyzer(config.analysis)
         self.screen_size = (0, 0)
+        self.current_book: Optional[RecentBook] = None
+        self.completed_book_keys: set[str] = set()
         self.debug_dir = (
             Path(config.runtime.debug_dir).resolve()
             if config.runtime.debug_dir
@@ -462,12 +772,356 @@ class HaoceReader:
             return
         time.sleep(delay_ms / 1000)
 
+    def _swipe_ratio(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        duration_ms: int,
+    ) -> None:
+        self.device.swipe(
+            self._ratio_to_abs(start),
+            self._ratio_to_abs(end),
+            duration_ms,
+        )
+
+    def _describe_book(self, book: Optional[RecentBook]) -> str:
+        if not book:
+            return "<unknown>"
+        if book.title and book.progress_text:
+            return f"{book.title} ({book.progress_text})"
+        if book.title:
+            return book.title
+        if book.progress_text:
+            return book.progress_text
+        return book.key
+
     def _save_debug(self, name: str, image: np.ndarray) -> None:
         if not self.debug_dir:
             return
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         path = self.debug_dir / name
         cv2.imwrite(str(path), image)
+
+    def _tap_continue_if_present(self, root: Optional[ET.Element] = None) -> bool:
+        if not self.config.navigation.auto_continue_from_report:
+            return False
+        if root is None:
+            root = self.device.dump_ui()
+        button = self.navigator.find_clickable_text(root, CONTINUE_READING_TEXT)
+        if not button:
+            return False
+        x, y = center(button)
+        log(f"found '{CONTINUE_READING_TEXT}', tapping {x},{y}")
+        self.device.tap(x, y)
+        self._sleep_ms(self.config.navigation.prepare_wait_ms)
+        return True
+
+    def _tap_start_reading_if_present(self, root: Optional[ET.Element] = None) -> bool:
+        if root is None:
+            root = self.device.dump_ui()
+        button = self.navigator.find_text_bounds(root, "开始阅读")
+        if not button:
+            return False
+        x, y = center(button)
+        log(f"found '开始阅读', tapping {x},{y}")
+        self.device.tap(x, y)
+        self._sleep_ms(self.config.navigation.prepare_wait_ms)
+        return True
+
+    def _open_recent_book(self, book: RecentBook) -> str:
+        x, y = center(book.bounds)
+        log(f"opening recent book: {self._describe_book(book)} at {x},{y}")
+        self.device.tap(x, y)
+        self.current_book = book
+        self._sleep_ms(self.config.navigation.prepare_wait_ms)
+        if self._tap_continue_if_present():
+            return "open_recent_then_continue"
+        return "open_recent"
+
+    def _refresh_recent_home(self) -> None:
+        log("refreshing home page to sync reading progress")
+        self._swipe_ratio((0.5, 0.34), (0.5, 0.78), 650)
+        self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 2500))
+
+    def _open_collection_book(self, book: RecentBook) -> str:
+        x, y = center(book.bounds)
+        log(f"opening collection book: {self._describe_book(book)} at {x},{y}")
+        self.device.tap(x, y)
+        self.current_book = book
+        self._sleep_ms(self.config.navigation.prepare_wait_ms)
+        candidate_root = self.device.dump_ui()
+        if self._tap_continue_if_present(candidate_root):
+            return "open_collection_then_continue"
+        if self._tap_start_reading_if_present(candidate_root):
+            return "open_collection_then_start"
+        if self.navigator._current_page_name(candidate_root) == "collection":
+            log("collection card tap did not leave the collection page")
+            return "open_collection_miss"
+        return "open_collection"
+
+    def _open_home_collection_page(self, root: ET.Element) -> Optional[ET.Element]:
+        bounds = self.navigator.find_home_collection_entry(root)
+        if not bounds:
+            return None
+        x, y = center(bounds)
+        log(f"opening collection entry at {x},{y}")
+        self.device.tap(x, y)
+        for _ in range(4):
+            self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1500))
+            current_root = self.device.dump_ui()
+            if self.navigator._current_page_name(current_root) == "collection":
+                return current_root
+        return None
+
+    def _find_next_collection_book(
+        self,
+        root: ET.Element,
+        max_scrolls: int = 12,
+    ) -> Optional[RecentBook]:
+        seen_signatures: set[tuple[str, ...]] = set()
+
+        for attempt in range(max_scrolls + 1):
+            books = self.navigator.list_collection_books(root)
+            signature = tuple(book.key for book in books)
+            if signature in seen_signatures:
+                break
+            seen_signatures.add(signature)
+
+            for book in books:
+                if book.key in self.completed_book_keys:
+                    continue
+                if not book.is_complete():
+                    return book
+
+            if attempt == max_scrolls:
+                break
+
+            log("no unfinished visible collection book yet, scrolling collection list")
+            self._swipe_ratio((0.5, 0.8), (0.5, 0.34), 550)
+            self._sleep_ms(self.config.page_turn.settle_ms)
+            root = self.device.dump_ui()
+
+        return None
+
+    def _collection_slot_points(self) -> list[tuple[int, int]]:
+        return [
+            self._ratio_to_abs((0.17, 0.41)),
+            self._ratio_to_abs((0.50, 0.41)),
+            self._ratio_to_abs((0.83, 0.41)),
+            self._ratio_to_abs((0.17, 0.63)),
+            self._ratio_to_abs((0.50, 0.63)),
+            self._ratio_to_abs((0.83, 0.63)),
+        ]
+
+    def _open_next_collection_book_by_slots(
+        self,
+        root: ET.Element,
+        max_pages: int = 8,
+    ) -> str:
+        tried_slots: set[tuple[int, int, int]] = set()
+
+        for page_index in range(max_pages):
+            for slot_index, point in enumerate(self._collection_slot_points()):
+                slot_key = (page_index, point[0], point[1])
+                if slot_key in tried_slots:
+                    continue
+                tried_slots.add(slot_key)
+
+                log(
+                    f"trying collection slot page={page_index + 1} slot={slot_index + 1} at {point[0]},{point[1]}"
+                )
+                self.device.tap(point[0], point[1])
+                self._sleep_ms(self.config.navigation.prepare_wait_ms + 1000)
+                candidate_root = self.device.dump_ui()
+                report_progress = self.navigator.report_progress(candidate_root)
+                detail_progress = self.navigator.detail_progress(candidate_root)
+                continue_bounds = self.navigator.find_clickable_text(
+                    candidate_root,
+                    CONTINUE_READING_TEXT,
+                )
+                start_bounds = self.navigator.find_text_bounds(candidate_root, "开始阅读")
+                opened_book = (
+                    continue_bounds is not None
+                    or start_bounds is not None
+                    or report_progress is not None
+                    or detail_progress is not None
+                )
+
+                if not opened_book:
+                    continue
+
+                title = (
+                    self.navigator.report_title(candidate_root)
+                    or self.navigator.detail_title(candidate_root)
+                    or f"collection-slot-{page_index + 1}-{slot_index + 1}"
+                )
+                progress = (
+                    report_progress
+                    if report_progress is not None
+                    else detail_progress
+                )
+                progress_text = (
+                    f"进度:{progress:.2f}%"
+                    if progress is not None
+                    else "进度:unknown"
+                )
+                log(
+                    f"collection candidate opened: {title}, progress={progress_text}"
+                )
+
+                if progress is not None and progress >= 99.9:
+                    log("candidate book is already complete, going back to collection page")
+                    self.device.back()
+                    self._sleep_ms(self.config.navigation.prepare_wait_ms)
+                    root = self.device.dump_ui()
+                    continue
+
+                self.current_book = RecentBook(
+                    title=title,
+                    image_key=None,
+                    progress_text=progress_text,
+                    progress_percent=progress,
+                    bounds=(0, 0, 0, 0),
+                )
+                if self._tap_continue_if_present(candidate_root):
+                    return "open_collection_then_continue"
+                if self._tap_start_reading_if_present(candidate_root):
+                    return "open_collection_then_start"
+                return "open_collection"
+
+            if page_index == max_pages - 1:
+                break
+
+            log("scrolling collection page to look for more books")
+            self._swipe_ratio((0.5, 0.82), (0.5, 0.3), 650)
+            self._sleep_ms(self.config.page_turn.settle_ms)
+            root = self.device.dump_ui()
+
+        return "all_done"
+
+    def _prepare_reading_page(self) -> str:
+        root = self.device.dump_ui()
+
+        if self._tap_continue_if_present(root):
+            return "continue"
+
+        if self.config.navigation.open_recent_index and self.config.navigation.open_recent_index > 0:
+            items = self.navigator.list_recent_books(root)
+            if items and len(items) >= self.config.navigation.open_recent_index:
+                return self._open_recent_book(
+                    items[self.config.navigation.open_recent_index - 1]
+                )
+
+        return "noop"
+
+    def _return_to_recent_home(
+        self,
+        max_back_steps: int = 4,
+    ) -> Optional[ET.Element]:
+        for step in range(max_back_steps + 1):
+            root = self.device.dump_ui()
+            books = self.navigator.list_recent_books(root)
+            if books:
+                log(f"recent reading page ready with {len(books)} visible books")
+                return root
+            if step == max_back_steps:
+                break
+            log("recent reading not visible yet, pressing back")
+            self.device.back()
+            self._sleep_ms(self.config.navigation.prepare_wait_ms)
+        return None
+
+    def _find_current_book_on_home(
+        self,
+        root: ET.Element,
+    ) -> Optional[RecentBook]:
+        if not self.current_book:
+            return None
+        if self.current_book.image_key:
+            found = self.navigator.find_recent_book_by_key(root, self.current_book.key)
+            if found:
+                return found
+        books = self.navigator.list_recent_books(root)
+        if not books:
+            return None
+        return books[0]
+
+    def _wait_for_home_progress_refresh(
+        self,
+        attempts: int = 3,
+    ) -> tuple[Optional[ET.Element], Optional[RecentBook]]:
+        root = self._return_to_recent_home()
+        if root is None:
+            return None, None
+
+        self._refresh_recent_home()
+        root = self.device.dump_ui()
+        current = self._find_current_book_on_home(root)
+        for attempt in range(attempts):
+            if current and current.is_complete():
+                return root, current
+            if attempt == attempts - 1:
+                break
+            log("current book is not shown as completed yet, waiting for home progress refresh")
+            self._sleep_ms(self.config.navigation.prepare_wait_ms)
+            self._refresh_recent_home()
+            root = self.device.dump_ui()
+            current = self._find_current_book_on_home(root)
+        return root, current
+
+    def _switch_to_next_book(self) -> str:
+        if not self.current_book:
+            log("current book is unknown, cannot safely switch to the next book")
+            return "stop"
+
+        root, current_on_home = self._wait_for_home_progress_refresh()
+        if root is None:
+            log("failed to return to recent reading page")
+            return "stop"
+
+        if current_on_home is None:
+            log(
+                f"current book {self._describe_book(self.current_book)} was not found in visible recent books"
+            )
+            return "stop"
+
+        if not current_on_home.is_complete():
+            log(
+                "page turn was not confirmed, but current book progress is still "
+                f"{current_on_home.progress_text}; stopping to avoid switching books by mistake"
+            )
+            return "stop"
+
+        self.completed_book_keys.add(current_on_home.key)
+        log(f"book completed: {self._describe_book(current_on_home)}")
+
+        collection_root = self._open_home_collection_page(root)
+        if collection_root is None:
+            log("home collection entry was not found, cannot choose the next book")
+            return "stop"
+
+        next_book = self._find_next_collection_book(collection_root)
+        if next_book:
+            action = self._open_collection_book(next_book)
+            if action == "open_collection_miss":
+                log("parsed collection card did not open, falling back to visible slot scanning")
+            else:
+                log(f"switched to next book: {self._describe_book(next_book)}, action={action}")
+                return "opened_next"
+
+        log("collection page UI did not expose book cards, falling back to visible slot scanning")
+        action = self._open_next_collection_book_by_slots(collection_root)
+        if action in {
+            "open_collection",
+            "open_collection_then_continue",
+            "open_collection_then_start",
+        }:
+            log(f"switched to next book by slot fallback, action={action}")
+            return "opened_next"
+
+        self.current_book = None
+        log("no unfinished book found in the collection page, stopping")
+        return "all_done"
 
     def doctor(self) -> int:
         self.device.ensure_ready()
@@ -509,11 +1163,9 @@ class HaoceReader:
         if self.config.navigation.launch_app:
             log(f"launching {self.config.package}")
             self.device.launch_app()
-            time.sleep(self.config.navigation.prepare_wait_ms / 1000)
+            self._sleep_ms(self.config.navigation.prepare_wait_ms)
         if not skip_prepare:
-            result = self.navigator.prepare_reading_page(self.config.navigation)
-            if result != "noop":
-                time.sleep(self.config.navigation.prepare_wait_ms / 1000)
+            result = self._prepare_reading_page()
             log(f"prepare result: {result}")
 
     def perform_scroll(self) -> None:
@@ -589,6 +1241,7 @@ class HaoceReader:
         while True:
             iteration += 1
             pause_after_page_turn = False
+            pause_after_book_switch = False
             before = self.device.capture()
             self.perform_scroll()
             self._sleep_ms(self.config.scroll.settle_ms)
@@ -629,10 +1282,17 @@ class HaoceReader:
                     pause_after_page_turn = True
                     log(f"moved to next section, total page turns: {page_turns}")
                 else:
-                    self._save_debug("turn_before.png", before_turn)
-                    self._save_debug("turn_after.png", after_turn)
-                    log("page turn not confirmed, stopping to avoid misfire")
-                    return 2
+                    switch_result = self._switch_to_next_book()
+                    if switch_result == "opened_next":
+                        stuck_count = 0
+                        pause_after_book_switch = True
+                    elif switch_result == "all_done":
+                        return 0
+                    else:
+                        self._save_debug("turn_before.png", before_turn)
+                        self._save_debug("turn_after.png", after_turn)
+                        log("page turn not confirmed, stopping to avoid misfire")
+                        return 2
             else:
                 stuck_count = 0
                 if self.config.scroll.pause_ms > 0:
@@ -656,6 +1316,12 @@ class HaoceReader:
             if pause_after_page_turn and self.config.scroll.pause_ms > 0:
                 log(
                     f"page-turn pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
+                )
+                self._sleep_ms(self.config.scroll.pause_ms)
+
+            if pause_after_book_switch and self.config.scroll.pause_ms > 0:
+                log(
+                    f"book-switch pause: waiting {self.config.scroll.pause_ms}ms before next upward swipe"
                 )
                 self._sleep_ms(self.config.scroll.pause_ms)
 

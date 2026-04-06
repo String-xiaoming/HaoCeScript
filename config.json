@@ -27,7 +27,7 @@
     "duration_ms": 520,
     "duration_jitter_ms": 180,
     "settle_ms": 1200,
-    "pause_ms": 15000
+    "pause_ms": 13000
   },
   "page_turn": {
     "action": "swipe",
@@ -68,7 +68,7 @@
   },
   "runtime": {
     "loop_sleep_ms": 250,
-    "max_page_turns": 30,
+    "max_page_turns": 0,
     "max_minutes": 0,
     "debug_dir": "debug"
   }
