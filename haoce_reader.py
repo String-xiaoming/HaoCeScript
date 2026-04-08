@@ -18,9 +18,24 @@ import numpy as np
 
 
 CONTINUE_READING_TEXT = "继续阅读"
+START_READING_TEXT = "开始阅读"
+UPDATE_BUTTON_TEXT = "更新"
+SEARCH_BOOK_TEXT = "搜索图书"
 RECENT_READING_TEXT = "最近阅读"
 PROGRESS_PREFIX = "进度:"
 EXCLUDED_COLLECTION_CATEGORIES = {"重点图书"}
+GENERIC_BOOK_LABELS = {"书香理工", "人文理工", "校图书读书工程", "重点图书"}
+
+
+DETAIL_PAGE_HINT_TEXTS = (
+    "\u4f5c\u8005",
+    "\u51fa\u7248\u793e",
+    "\u603b\u5b57\u6570",
+    "\u7b80\u4ecb",
+    "\u6e29\u99a8\u63d0\u793a",
+)
+HOME_ENTRY_UPDATE_ROUNDS = 3
+RETURNED_DETAIL_SYNC_ROUNDS = 3
 
 
 def log(message: str) -> None:
@@ -50,6 +65,45 @@ def center(bounds: tuple[int, int, int, int]) -> tuple[int, int]:
 def area(bounds: tuple[int, int, int, int]) -> int:
     x1, y1, x2, y2 = bounds
     return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def clean_book_title_candidate(title: Optional[str]) -> Optional[str]:
+    if not title:
+        return None
+    normalized = " ".join(str(title).split()).strip()
+    if not normalized or normalized in {"•", "<unknown>"}:
+        return None
+    if normalized in GENERIC_BOOK_LABELS:
+        return None
+    return normalized
+
+
+def expand_bounds(
+    bounds: tuple[int, int, int, int],
+    pad_left: int,
+    pad_top: int,
+    pad_right: int,
+    pad_bottom: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bounds
+    return (
+        max(0, x1 - pad_left),
+        max(0, y1 - pad_top),
+        x2 + pad_right,
+        y2 + pad_bottom,
+    )
+
+
+def union_bounds(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    return (
+        min(left[0], right[0]),
+        min(left[1], right[1]),
+        max(left[2], right[2]),
+        max(left[3], right[3]),
+    )
 
 
 def iter_nodes(node: ET.Element) -> Iterator[ET.Element]:
@@ -109,6 +163,7 @@ class RuntimeConfig:
     max_minutes: int
     debug_dir: Optional[str]
     selection_blacklist_file: Optional[str]
+    completion_verify_attempts: int
 
 
 @dataclass
@@ -243,6 +298,9 @@ def load_config(path: Path) -> ReaderConfig:
             selection_blacklist_file=runtime.get(
                 "selection_blacklist_file",
                 "selection_blacklist.json",
+            ),
+            completion_verify_attempts=max(
+                1, int(runtime.get("completion_verify_attempts", 2))
             ),
         ),
     )
@@ -454,7 +512,7 @@ class UiNavigator:
             if best_y is None or bounds[1] < best_y:
                 best_text = text
                 best_y = bounds[1]
-        return best_text
+        return clean_book_title_candidate(best_text)
 
     def report_progress(self, root: ET.Element) -> Optional[float]:
         subtree = self._page_subtree(root, "report")
@@ -536,7 +594,7 @@ class UiNavigator:
             if current_area > best_area:
                 best_text = text
                 best_area = current_area
-        return best_text
+        return clean_book_title_candidate(best_text)
 
     def detail_progress(self, root: ET.Element) -> Optional[float]:
         start_bounds = self.find_text_bounds(root, "开始阅读")
@@ -600,8 +658,11 @@ class UiNavigator:
                 if "Image" in child_class and image_key is None:
                     image_key = text
                     continue
-                if not title:
-                    title = text
+                candidate_title = clean_book_title_candidate(text)
+                if candidate_title and not title:
+                    title = candidate_title
+
+            title = clean_book_title_candidate(title) or ""
 
             if not progress_text:
                 continue
@@ -653,21 +714,51 @@ class UiNavigator:
         if subtree is None:
             return None
 
-        candidates: list[tuple[int, int, int, int]] = []
+        text_candidates: list[tuple[int, int, int, int]] = []
+        image_candidates: list[tuple[int, int, int, int]] = []
         for node in iter_nodes(subtree):
             text = (node.attrib.get("text") or "").strip()
             bounds_text = node.attrib.get("bounds")
-            if text != "书香理工" or not bounds_text:
+            if not bounds_text:
                 continue
             bounds = parse_bounds(bounds_text)
-            if bounds[1] < 1100:
-                candidates.append(bounds)
+            if area(bounds) <= 0 or bounds[1] >= 1100:
+                continue
 
-        if not candidates:
+            if text == "书香理工":
+                text_candidates.append(bounds)
+                continue
+
+            class_name = node.attrib.get("class", "")
+            if "Image" in class_name and area(bounds) >= 8000:
+                image_candidates.append(bounds)
+
+        if not text_candidates:
             return None
 
-        x1, y1, x2, y2 = min(candidates, key=lambda item: (item[1], item[0]))
-        return max(0, x1 - 24), max(0, y1 - 180), x2 + 24, y2 + 24
+        text_bounds = min(text_candidates, key=lambda item: (item[1], item[0]))
+        tap_bounds = expand_bounds(text_bounds, 24, 180, 24, 24)
+        text_center = center(text_bounds)
+        best_image: Optional[tuple[int, int, int, int]] = None
+        best_score: Optional[int] = None
+
+        for image_bounds in image_candidates:
+            image_center = center(image_bounds)
+            horizontal_distance = abs(image_center[0] - text_center[0])
+            vertical_gap = text_bounds[1] - image_bounds[3]
+            if horizontal_distance > 220:
+                continue
+            if vertical_gap < -80 or vertical_gap > 260:
+                continue
+            score = horizontal_distance * 4 + abs(vertical_gap)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_image = image_bounds
+
+        if best_image is not None:
+            return expand_bounds(best_image, 18, 18, 18, 18)
+
+        return tap_bounds
 
     def current_collection_category(self, root: ET.Element) -> Optional[str]:
         subtree = self._page_subtree(root, "collection")
@@ -758,7 +849,16 @@ class UiNavigator:
                 if text != "• " and not title:
                     title = text
 
-            if not progress_text or not title:
+            title = clean_book_title_candidate(title) or ""
+            if not title:
+                for child in direct_children:
+                    candidate_title = clean_book_title_candidate(
+                        (child.attrib.get("text") or "").strip()
+                    )
+                    if candidate_title:
+                        title = candidate_title
+                        break
+            if not progress_text or (not title and not image_key):
                 continue
 
             bounds = parse_bounds(bounds_text)
@@ -834,6 +934,8 @@ class HaoceReader:
         self.screen_size = (0, 0)
         self.current_book: Optional[RecentBook] = None
         self.completed_book_keys: set[str] = set()
+        self.completed_book_titles: set[str] = set()
+        self.incomplete_completion_verifications: dict[str, int] = {}
         self.debug_dir = (
             Path(config.runtime.debug_dir).resolve()
             if config.runtime.debug_dir
@@ -849,6 +951,10 @@ class HaoceReader:
         self._load_selection_blacklist()
 
     def _normalize_book_title(self, title: Optional[str]) -> Optional[str]:
+        normalized = clean_book_title_candidate(title)
+        if not normalized or normalized.startswith("collection-slot-"):
+            return None
+        return normalized
         if not title:
             return None
         normalized = " ".join(title.split()).strip()
@@ -865,6 +971,44 @@ class HaoceReader:
             return None
         normalized = book.image_key.strip()
         return normalized or None
+
+    def _completion_verification_key(self, book: RecentBook) -> str:
+        key = self._selection_blacklist_key(book)
+        if key:
+            return f"key:{key}"
+
+        title = self._normalize_book_title(book.title)
+        if title:
+            return f"title:{title}"
+
+        return f"raw:{book.key}"
+
+    def _mark_book_completed(self, book: RecentBook) -> None:
+        title = self._normalize_book_title(book.title)
+        if title:
+            self.completed_book_titles.add(title)
+        self.completed_book_keys.add(book.key)
+        self.incomplete_completion_verifications.pop(
+            self._completion_verification_key(book),
+            None,
+        )
+
+    def _is_marked_completed(self, book: RecentBook) -> bool:
+        title = self._normalize_book_title(book.title)
+        if title and title in self.completed_book_titles:
+            return True
+        return book.key in self.completed_book_keys
+
+    def _same_book(self, left: Optional[RecentBook], right: Optional[RecentBook]) -> bool:
+        if not left or not right:
+            return False
+        left_key = self._selection_blacklist_key(left)
+        right_key = self._selection_blacklist_key(right)
+        if left_key and right_key and left_key == right_key:
+            return True
+        left_title = self._normalize_book_title(left.title)
+        right_title = self._normalize_book_title(right.title)
+        return bool(left_title and right_title and left_title == right_title)
 
     def _load_selection_blacklist(self) -> None:
         if not self.selection_blacklist_path or not self.selection_blacklist_path.exists():
@@ -942,7 +1086,8 @@ class HaoceReader:
         title = (
             self.navigator.report_title(candidate_root)
             or self.navigator.detail_title(candidate_root)
-            or fallback_book.title
+            or clean_book_title_candidate(fallback_book.title)
+            or ""
         )
         progress = self.navigator.report_progress(candidate_root)
         if progress is None:
@@ -1040,10 +1185,11 @@ class HaoceReader:
     def _describe_book(self, book: Optional[RecentBook]) -> str:
         if not book:
             return "<unknown>"
-        if book.title and book.progress_text:
-            return f"{book.title} ({book.progress_text})"
-        if book.title:
-            return book.title
+        title = self._normalize_book_title(book.title) or self._selection_blacklist_key(book)
+        if title and book.progress_text:
+            return f"{title} ({book.progress_text})"
+        if title:
+            return title
         if book.progress_text:
             return book.progress_text
         return book.key
@@ -1069,14 +1215,51 @@ class HaoceReader:
         self._sleep_ms(self.config.navigation.prepare_wait_ms)
         return True
 
+    def _tap_detail_update_if_present(
+        self,
+        root: Optional[ET.Element] = None,
+    ) -> ET.Element:
+        if root is None:
+            root = self.device.dump_ui()
+
+        button = self.navigator.find_text_bounds(root, UPDATE_BUTTON_TEXT)
+        if not button:
+            return root
+
+        x, y = center(button)
+        log(f"found '{UPDATE_BUTTON_TEXT}', tapping {x},{y}")
+        self.device.tap(x, y)
+        self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1200))
+        return self.device.dump_ui()
+
+    def _tap_detail_update_repeatedly(
+        self,
+        root: Optional[ET.Element] = None,
+        rounds: int = HOME_ENTRY_UPDATE_ROUNDS,
+        context_label: str = "detail update",
+    ) -> ET.Element:
+        if root is None:
+            root = self.device.dump_ui()
+
+        current_root = root
+        for round_index in range(max(0, rounds)):
+            if not self.navigator.find_text_bounds(current_root, UPDATE_BUTTON_TEXT):
+                break
+            log(
+                f"{context_label}: tapping '{UPDATE_BUTTON_TEXT}' "
+                f"{round_index + 1}/{rounds}"
+            )
+            current_root = self._tap_detail_update_if_present(current_root)
+        return current_root
+
     def _tap_start_reading_if_present(self, root: Optional[ET.Element] = None) -> bool:
         if root is None:
             root = self.device.dump_ui()
-        button = self.navigator.find_text_bounds(root, "开始阅读")
+        button = self.navigator.find_text_bounds(root, START_READING_TEXT)
         if not button:
             return False
         x, y = center(button)
-        log(f"found '开始阅读', tapping {x},{y}")
+        log(f"found '{START_READING_TEXT}', tapping {x},{y}")
         self.device.tap(x, y)
         self._sleep_ms(self.config.navigation.prepare_wait_ms)
         return True
@@ -1085,16 +1268,110 @@ class HaoceReader:
         x, y = center(book.bounds)
         log(f"opening recent book: {self._describe_book(book)} at {x},{y}")
         self.device.tap(x, y)
-        self.current_book = book
         self._sleep_ms(self.config.navigation.prepare_wait_ms)
-        if self._tap_continue_if_present():
+        root = self.device.dump_ui()
+        root = self._tap_detail_update_repeatedly(
+            root,
+            rounds=HOME_ENTRY_UPDATE_ROUNDS,
+            context_label="home recent entry sync",
+        )
+        self.current_book = self._resolve_collection_book(root, book)
+        if self._tap_continue_if_present(root):
             return "open_recent_then_continue"
+        if self._tap_start_reading_if_present(root):
+            return "open_recent_then_start"
         return "open_recent"
 
     def _refresh_recent_home(self) -> None:
         log("refreshing home page to sync reading progress")
         self._swipe_ratio((0.5, 0.34), (0.5, 0.78), 650)
         self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 2500))
+
+    def _refresh_current_book_page(self) -> ET.Element:
+        log("refreshing current page to sync reading progress")
+        self._swipe_ratio((0.5, 0.34), (0.5, 0.78), 650)
+        self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 2500))
+        return self.device.dump_ui()
+
+    def _looks_like_refreshable_book_page(self, root: ET.Element) -> bool:
+        page_name = self.navigator._current_page_name(root)
+        if page_name in {"home", "report"}:
+            return False
+        if self.navigator.find_text_bounds(root, UPDATE_BUTTON_TEXT):
+            return False
+        if self.navigator.find_text_bounds(root, SEARCH_BOOK_TEXT):
+            return True
+
+        progress_like_count = 0
+        for node in iter_nodes(root):
+            text = (node.attrib.get("text") or "").strip()
+            bounds_text = node.attrib.get("bounds")
+            if not text or not bounds_text:
+                continue
+            bounds = parse_bounds(bounds_text)
+            if area(bounds) <= 0:
+                continue
+            if "进度" in text or "%" in text:
+                progress_like_count += 1
+                if progress_like_count >= 2:
+                    return True
+        return False
+
+    def _sync_page_after_back(self, root: ET.Element) -> ET.Element:
+        updated_root = self._tap_detail_update_if_present(root)
+        if self._looks_like_refreshable_book_page(updated_root):
+            return self._refresh_current_book_page()
+        return updated_root
+
+    def _looks_like_returned_book_entry_page(
+        self,
+        root: ET.Element,
+    ) -> bool:
+        page_name = self.navigator._current_page_name(root)
+        if page_name in {"home", "collection"}:
+            return False
+        if page_name == "report":
+            return False
+        if not self.navigator.find_text_bounds(root, START_READING_TEXT):
+            return False
+
+        hint_count = 0
+        for hint_text in DETAIL_PAGE_HINT_TEXTS:
+            if self.navigator.find_text_bounds(root, hint_text):
+                hint_count += 1
+                if hint_count >= 2:
+                    return True
+
+        return (
+            self.navigator.detail_title(root) is not None
+            or self.navigator.detail_progress(root) is not None
+        )
+
+    def _sync_page_after_back_once(
+        self,
+        root: ET.Element,
+    ) -> tuple[ET.Element, bool]:
+        current_root = root
+
+        if self._looks_like_returned_book_entry_page(current_root):
+            log(
+                "returned to the collection detail page after reading, "
+                f"refreshing it {RETURNED_DETAIL_SYNC_ROUNDS} time(s) before leaving"
+            )
+            for round_index in range(RETURNED_DETAIL_SYNC_ROUNDS):
+                log(
+                    f"collection detail refresh "
+                    f"{round_index + 1}/{RETURNED_DETAIL_SYNC_ROUNDS}"
+                )
+                current_root = self._refresh_current_book_page()
+            return current_root, True
+
+        did_sync = False
+        if self.navigator.find_text_bounds(current_root, UPDATE_BUTTON_TEXT):
+            current_root = self._tap_detail_update_if_present(current_root)
+            did_sync = True
+
+        return current_root, did_sync
 
     def _open_collection_book(self, book: RecentBook) -> str:
         x, y = center(book.bounds)
@@ -1105,6 +1382,8 @@ class HaoceReader:
         if self.navigator._current_page_name(candidate_root) == "collection":
             log("collection card tap did not leave the collection page")
             return "open_collection_miss"
+
+        candidate_root = self._tap_detail_update_if_present(candidate_root)
 
         selected_book = self._resolve_collection_book(candidate_root, book)
         if self._selection_blacklist_contains(selected_book):
@@ -1123,17 +1402,47 @@ class HaoceReader:
         return "open_collection"
 
     def _open_home_collection_page(self, root: ET.Element) -> Optional[ET.Element]:
-        bounds = self.navigator.find_home_collection_entry(root)
-        if not bounds:
-            return None
-        x, y = center(bounds)
-        log(f"opening collection entry at {x},{y}")
-        self.device.tap(x, y)
-        for _ in range(4):
-            self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1500))
-            current_root = self.device.dump_ui()
+        current_root = root
+        for attempt in range(3):
             if self.navigator._current_page_name(current_root) == "collection":
                 return current_root
+
+            bounds = self.navigator.find_home_collection_entry(current_root)
+            if not bounds:
+                self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1200))
+                current_root = self.device.dump_ui()
+                continue
+
+            x, y = center(bounds)
+            log(f"opening collection entry at {x},{y} (attempt {attempt + 1})")
+            self.device.tap(x, y)
+            for _ in range(4):
+                self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1500))
+                current_root = self.device.dump_ui()
+                if self.navigator._current_page_name(current_root) == "collection":
+                    return current_root
+
+            log("collection entry tap stayed on home, trying to clear the loading overlay")
+            self.device.back()
+            self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1200))
+            current_root = self.device.dump_ui()
+            if (
+                self.navigator._current_page_name(current_root) == "home"
+                and self.navigator.list_recent_books(current_root)
+            ):
+                log("home page became interactive again after back")
+            else:
+                log("back left the home page while recovering, relaunching app")
+                if self.config.navigation.launch_app:
+                    log(f"launching {self.config.package}")
+                    self.device.launch_app()
+                    self._sleep_ms(self.config.navigation.prepare_wait_ms)
+                current_root = self._return_to_recent_home()
+                if current_root is None:
+                    return None
+
+            log("collection entry tap did not leave home, retrying")
+
         return None
 
     def _pick_next_book_from_collection_root(
@@ -1253,18 +1562,13 @@ class HaoceReader:
         return current_root
 
     def _should_skip_collection_book(self, book: RecentBook) -> bool:
-        if book.key in self.completed_book_keys:
+        if self._is_marked_completed(book):
             return True
         if book.is_complete():
             return True
         if self._selection_blacklist_contains(book):
             return True
-        if (
-            self.current_book
-            and self.current_book.title
-            and book.title
-            and self.current_book.title.strip() == book.title.strip()
-        ):
+        if self._same_book(self.current_book, book):
             return True
         return False
 
@@ -1357,6 +1661,18 @@ class HaoceReader:
                 if not opened_book:
                     continue
 
+                candidate_root = self._tap_detail_update_if_present(candidate_root)
+                report_progress = self.navigator.report_progress(candidate_root)
+                detail_progress = self.navigator.detail_progress(candidate_root)
+                continue_bounds = self.navigator.find_clickable_text(
+                    candidate_root,
+                    CONTINUE_READING_TEXT,
+                )
+                start_bounds = self.navigator.find_text_bounds(
+                    candidate_root,
+                    START_READING_TEXT,
+                )
+
                 title = (
                     self.navigator.report_title(candidate_root)
                     or self.navigator.detail_title(candidate_root)
@@ -1383,12 +1699,7 @@ class HaoceReader:
                     f"collection candidate opened: {title}, progress={progress_text}"
                 )
 
-                if (
-                    self.current_book
-                    and self.current_book.title
-                    and title
-                    and self.current_book.title.strip() == title.strip()
-                ):
+                if self._same_book(self.current_book, selected_book):
                     log("candidate book matches the current book, going back to try another one")
                     self.device.back()
                     self._sleep_ms(self.config.navigation.prepare_wait_ms)
@@ -1428,6 +1739,16 @@ class HaoceReader:
     def _prepare_reading_page(self) -> str:
         root = self.device.dump_ui()
         page_name = self.navigator._current_page_name(root)
+        if page_name == "report" or self.navigator.find_clickable_text(root, CONTINUE_READING_TEXT):
+            root = self._tap_detail_update_repeatedly(
+                root,
+                rounds=HOME_ENTRY_UPDATE_ROUNDS,
+                context_label="home entry sync",
+            )
+            page_name = self.navigator._current_page_name(root)
+        else:
+            root = self._tap_detail_update_if_present(root)
+            page_name = self.navigator._current_page_name(root)
 
         if page_name == "collection":
             log("already on collection page during prepare, choosing a book from current collection")
@@ -1435,16 +1756,24 @@ class HaoceReader:
 
         if self._tap_continue_if_present(root):
             return "continue"
+        if self._tap_start_reading_if_present(root):
+            return "start"
 
         items = self.navigator.list_recent_books(root)
         if items:
             first_recent = items[0]
-            if first_recent.is_complete():
-                self.completed_book_keys.add(first_recent.key)
-                log(
-                    "first recent book is already complete, "
-                    "opening collection page to choose a new book"
-                )
+            if first_recent.is_complete() or self._is_marked_completed(first_recent):
+                self._mark_book_completed(first_recent)
+                if first_recent.is_complete():
+                    log(
+                        "first recent book is already complete, "
+                        "opening collection page to choose a new book"
+                    )
+                else:
+                    log(
+                        "first recent book has already been verified as done for this run, "
+                        "opening collection page to choose a new book"
+                    )
                 result = self._open_next_book_from_collection(root)
                 if result == "opened_next":
                     return "first_recent_complete_then_opened_next"
@@ -1462,17 +1791,33 @@ class HaoceReader:
         self,
         max_back_steps: int = 4,
     ) -> Optional[ET.Element]:
-        for step in range(max_back_steps + 1):
+        back_steps = 0
+        synced_since_last_back = False
+
+        while back_steps <= max_back_steps:
             root = self.device.dump_ui()
             books = self.navigator.list_recent_books(root)
             if books:
                 log(f"recent reading page ready with {len(books)} visible books")
                 return root
-            if step == max_back_steps:
+
+            if not synced_since_last_back:
+                root, did_sync = self._sync_page_after_back_once(root)
+                if did_sync:
+                    synced_since_last_back = True
+                    books = self.navigator.list_recent_books(root)
+                    if books:
+                        log(f"recent reading page ready with {len(books)} visible books")
+                        return root
+                    continue
+
+            if back_steps == max_back_steps:
                 break
             log("recent reading not visible yet, pressing back")
             self.device.back()
             self._sleep_ms(self.config.navigation.prepare_wait_ms)
+            back_steps += 1
+            synced_since_last_back = False
         return None
 
     def _find_current_book_on_home(
@@ -1513,6 +1858,41 @@ class HaoceReader:
             current = self._find_current_book_on_home(root)
         return root, current
 
+    def _handle_incomplete_completion_verification(
+        self,
+        root: ET.Element,
+        current_on_home: RecentBook,
+    ) -> str:
+        verify_key = self._completion_verification_key(current_on_home)
+        verification_count = (
+            self.incomplete_completion_verifications.get(verify_key, 0) + 1
+        )
+        self.incomplete_completion_verifications[verify_key] = verification_count
+        max_attempts = max(1, self.config.runtime.completion_verify_attempts)
+
+        if verification_count < max_attempts:
+            log(
+                "suspected end of book reached, but current book progress is still "
+                f"{current_on_home.progress_text}; verification "
+                f"{verification_count}/{max_attempts}, reopening the same book "
+                "to confirm before skipping"
+            )
+            reopen_result = self._open_recent_book(current_on_home)
+            log(
+                "reopened current book after incomplete completion verification, "
+                f"action={reopen_result}"
+            )
+            return "reopen_current"
+
+        log(
+            "current book still has progress "
+            f"{current_on_home.progress_text} after "
+            f"{verification_count}/{max_attempts} end-of-book verifications; "
+            "marking it as done for this run and moving on"
+        )
+        self._mark_book_completed(current_on_home)
+        return self._open_next_book_from_collection(root)
+
     def _switch_to_next_book(self) -> str:
         if not self.current_book:
             log("current book is unknown, cannot safely switch to the next book")
@@ -1530,13 +1910,12 @@ class HaoceReader:
             return "stop"
 
         if not current_on_home.is_complete():
-            log(
-                "page turn was not confirmed, but current book progress is still "
-                f"{current_on_home.progress_text}; stopping to avoid switching books by mistake"
+            return self._handle_incomplete_completion_verification(
+                root,
+                current_on_home,
             )
-            return "stop"
 
-        self.completed_book_keys.add(current_on_home.key)
+        self._mark_book_completed(current_on_home)
         log(f"book completed: {self._describe_book(current_on_home)}")
         return self._open_next_book_from_collection(root)
 
@@ -1708,7 +2087,7 @@ class HaoceReader:
                     log(f"moved to next section, total page turns: {page_turns}")
                 else:
                     switch_result = self._switch_to_next_book()
-                    if switch_result == "opened_next":
+                    if switch_result in {"opened_next", "reopen_current"}:
                         stuck_count = 0
                         pause_after_book_switch = True
                     elif switch_result == "all_done":
