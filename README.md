@@ -1,6 +1,8 @@
 # Haoce Auto Reader
 
-**GPT-5.4写的**
+**贵理工专用**
+
+GPT-5.4写的
 
 测试机型是 红米 note 10 pro(root),非全面屏状态下
 
