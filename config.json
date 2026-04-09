@@ -58,6 +58,38 @@
     "duration_jitter_ms": 120,
     "settle_ms": 1500
   },
+  "motion": {
+    "trajectory_points": [
+      4,
+      6
+    ],
+    "path_jitter": [
+      0.018,
+      0.026
+    ],
+    "lateral_chance": 0.22,
+    "lateral_distance_ratio": [
+      0.05,
+      0.12
+    ],
+    "lateral_duration_ms": [
+      180,
+      320
+    ],
+    "downward_chance": 0.18,
+    "downward_distance_ratio": [
+      0.06,
+      0.18
+    ],
+    "downward_duration_ms": [
+      260,
+      520
+    ],
+    "micro_settle_ms": [
+      350,
+      900
+    ]
+  },
   "analysis": {
     "crop": [
       0.06,

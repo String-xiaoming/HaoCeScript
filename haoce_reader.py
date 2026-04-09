@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 import subprocess
@@ -167,6 +168,19 @@ class RuntimeConfig:
 
 
 @dataclass
+class MotionConfig:
+    trajectory_points: tuple[int, int]
+    path_jitter: tuple[float, float]
+    lateral_chance: float
+    lateral_distance_ratio: tuple[float, float]
+    lateral_duration_ms: tuple[int, int]
+    downward_chance: float
+    downward_distance_ratio: tuple[float, float]
+    downward_duration_ms: tuple[int, int]
+    micro_settle_ms: tuple[int, int]
+
+
+@dataclass
 class ReaderConfig:
     serial: Optional[str]
     package: str
@@ -175,6 +189,7 @@ class ReaderConfig:
     page_turn: PageTurnConfig
     analysis: AnalysisConfig
     runtime: RuntimeConfig
+    motion: MotionConfig
 
 
 @dataclass
@@ -231,6 +246,25 @@ def parse_int_range(value: object, name: str) -> tuple[int, int]:
     raise ConfigError(f"{name} must be an integer or a 2-item range")
 
 
+def parse_float_range(value: object, name: str) -> tuple[float, float]:
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        if parsed < 0:
+            raise ConfigError(f"{name} must be >= 0")
+        return parsed, parsed
+
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        start = float(value[0])
+        end = float(value[1])
+        low = min(start, end)
+        high = max(start, end)
+        if low < 0:
+            raise ConfigError(f"{name} values must be >= 0")
+        return low, high
+
+    raise ConfigError(f"{name} must be a number or a 2-item range")
+
+
 def load_config(path: Path) -> ReaderConfig:
     raw = json.loads(path.read_text(encoding="utf-8"))
 
@@ -239,6 +273,7 @@ def load_config(path: Path) -> ReaderConfig:
     page_turn = raw["page_turn"]
     analysis = raw["analysis"]
     runtime = raw["runtime"]
+    motion = raw.get("motion", {})
 
     return ReaderConfig(
         serial=raw.get("serial"),
@@ -301,6 +336,40 @@ def load_config(path: Path) -> ReaderConfig:
             ),
             completion_verify_attempts=max(
                 1, int(runtime.get("completion_verify_attempts", 2))
+            ),
+        ),
+        motion=MotionConfig(
+            trajectory_points=parse_int_range(
+                motion.get("trajectory_points", [4, 6]),
+                "motion.trajectory_points",
+            ),
+            path_jitter=parse_float_range(
+                motion.get("path_jitter", [0.018, 0.026]),
+                "motion.path_jitter",
+            ),
+            lateral_chance=max(0.0, min(1.0, float(motion.get("lateral_chance", 0.22)))),
+            lateral_distance_ratio=parse_float_range(
+                motion.get("lateral_distance_ratio", [0.05, 0.12]),
+                "motion.lateral_distance_ratio",
+            ),
+            lateral_duration_ms=parse_int_range(
+                motion.get("lateral_duration_ms", [180, 320]),
+                "motion.lateral_duration_ms",
+            ),
+            downward_chance=max(
+                0.0, min(1.0, float(motion.get("downward_chance", 0.18)))
+            ),
+            downward_distance_ratio=parse_float_range(
+                motion.get("downward_distance_ratio", [0.06, 0.18]),
+                "motion.downward_distance_ratio",
+            ),
+            downward_duration_ms=parse_int_range(
+                motion.get("downward_duration_ms", [260, 520]),
+                "motion.downward_duration_ms",
+            ),
+            micro_settle_ms=parse_int_range(
+                motion.get("micro_settle_ms", [350, 900]),
+                "motion.micro_settle_ms",
             ),
         ),
     )
@@ -383,6 +452,36 @@ class AdbDevice:
             str(end[1]),
             str(duration_ms),
         )
+
+    def motionevent(self, action: str, x: int, y: int) -> None:
+        self.run("shell", "input", "motionevent", action, str(x), str(y))
+
+    def gesture(
+        self,
+        points: list[tuple[int, int]],
+        duration_ms: int,
+    ) -> None:
+        cleaned: list[tuple[int, int]] = []
+        for point in points:
+            if not cleaned or point != cleaned[-1]:
+                cleaned.append(point)
+
+        if len(cleaned) < 2:
+            return
+
+        interval_count = max(1, len(cleaned) - 1)
+        base_delay = max(1, duration_ms // interval_count)
+        remainder = max(0, duration_ms - base_delay * interval_count)
+
+        try:
+            self.motionevent("DOWN", cleaned[0][0], cleaned[0][1])
+            for index, point in enumerate(cleaned[1:], start=1):
+                delay_ms = base_delay + (1 if index <= remainder else 0)
+                time.sleep(delay_ms / 1000)
+                action = "UP" if index == len(cleaned) - 1 else "MOVE"
+                self.motionevent(action, point[0], point[1])
+        except subprocess.CalledProcessError:
+            self.swipe(cleaned[0], cleaned[-1], duration_ms)
 
     def capture(self) -> np.ndarray:
         result = self.run("exec-out", "screencap", "-p")
@@ -1142,6 +1241,173 @@ class HaoceReader:
             return base_duration
         return max(1, base_duration + random.randint(-jitter_ms, jitter_ms))
 
+    def _random_int_between(self, value_range: tuple[int, int]) -> int:
+        low, high = value_range
+        return low if low == high else random.randint(low, high)
+
+    def _random_float_between(self, value_range: tuple[float, float]) -> float:
+        low, high = value_range
+        return low if math.isclose(low, high) else random.uniform(low, high)
+
+    def _build_trajectory_points(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+    ) -> list[tuple[int, int]]:
+        point_count = max(2, self._random_int_between(self.config.motion.trajectory_points))
+        if point_count <= 2:
+            return [start, end]
+
+        if self.screen_size == (0, 0):
+            self.screen_size = self.device.wm_size()
+        width, height = self.screen_size
+        jitter_x = width * self.config.motion.path_jitter[0]
+        jitter_y = height * self.config.motion.path_jitter[1]
+
+        points: list[tuple[int, int]] = []
+        for index in range(point_count):
+            t = index / (point_count - 1)
+            base_x = start[0] + (end[0] - start[0]) * t
+            base_y = start[1] + (end[1] - start[1]) * t
+            curve = math.sin(math.pi * t)
+            offset_x = random.uniform(-jitter_x, jitter_x) * curve
+            offset_y = random.uniform(-jitter_y, jitter_y) * curve
+            point = self._clamp_point(
+                (int(round(base_x + offset_x)), int(round(base_y + offset_y)))
+            )
+            if not points or point != points[-1]:
+                points.append(point)
+
+        if len(points) < 2:
+            return [start, end]
+
+        points[0] = start
+        points[-1] = end
+        return points
+
+    def _perform_gesture(
+        self,
+        label: str,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        duration_ms: int,
+    ) -> None:
+        points = self._build_trajectory_points(start, end)
+        log(
+            "{0}: start=({1},{2}) end=({3},{4}) duration={5}ms track_points={6}".format(
+                label,
+                start[0],
+                start[1],
+                end[0],
+                end[1],
+                duration_ms,
+                len(points),
+            )
+        )
+        self.device.gesture(points, duration_ms)
+
+    def _pause_ratio(self, pause_ms: int) -> float:
+        low, high = self.config.scroll.pause_ms
+        if high <= low:
+            return 0.5
+        ratio = (pause_ms - low) / (high - low)
+        return max(0.0, min(1.0, ratio))
+
+    def _perform_lateral_drift(self) -> int:
+        distance_ratio = self._random_float_between(
+            self.config.motion.lateral_distance_ratio
+        )
+        duration_ms = self._random_int_between(self.config.motion.lateral_duration_ms)
+        center_x = random.uniform(0.42, 0.58)
+        center_y = random.uniform(0.46, 0.68)
+        half_distance = distance_ratio / 2
+        direction = random.choice([-1.0, 1.0])
+        start_ratio = (
+            center_x - half_distance * direction,
+            center_y + random.uniform(-0.02, 0.02),
+        )
+        end_ratio = (
+            center_x + half_distance * direction,
+            center_y + random.uniform(-0.02, 0.02),
+        )
+        start = self._clamp_point(self._ratio_to_abs(start_ratio))
+        end = self._clamp_point(self._ratio_to_abs(end_ratio))
+        self._perform_gesture("lateral drift swipe", start, end, duration_ms)
+        return duration_ms
+
+    def _perform_downward_review(self, pause_ms: int) -> int:
+        pause_ratio = self._pause_ratio(pause_ms)
+        low_distance, high_distance = self.config.motion.downward_distance_ratio
+        distance_ratio = low_distance + (high_distance - low_distance) * pause_ratio
+        distance_ratio *= random.uniform(0.92, 1.08)
+        distance_ratio = max(low_distance, min(high_distance, distance_ratio))
+        duration_ms = self._random_int_between(self.config.motion.downward_duration_ms)
+        start_ratio = (
+            random.uniform(0.42, 0.58),
+            random.uniform(0.34, 0.46),
+        )
+        end_ratio = (
+            start_ratio[0] + random.uniform(-0.025, 0.025),
+            min(0.82, start_ratio[1] + distance_ratio),
+        )
+        start = self._clamp_point(self._ratio_to_abs(start_ratio))
+        end = self._clamp_point(self._ratio_to_abs(end_ratio))
+        log(
+            "downward review swipe: pause_ratio={0:.2f}, distance_ratio={1:.3f}".format(
+                pause_ratio,
+                distance_ratio,
+            )
+        )
+        self._perform_gesture("downward review swipe", start, end, duration_ms)
+        return duration_ms
+
+    def _perform_pause_actions(
+        self,
+        label: str,
+        pause_ms: int,
+    ) -> None:
+        if pause_ms <= 0:
+            return
+
+        actions: list[str] = []
+        if random.random() < self.config.motion.lateral_chance:
+            actions.append("lateral")
+        if random.random() < self.config.motion.downward_chance:
+            actions.append("downward")
+
+        if not actions:
+            self._sleep_ms(pause_ms)
+            return
+
+        random.shuffle(actions)
+        remaining_ms = pause_ms
+
+        for index, action in enumerate(actions):
+            slots_left = len(actions) - index
+            wait_cap = max(0, remaining_ms // (slots_left + 1))
+            if wait_cap > 0:
+                wait_ms = random.randint(0, wait_cap)
+                self._sleep_ms(wait_ms)
+                remaining_ms = max(0, remaining_ms - wait_ms)
+
+            used_ms = (
+                self._perform_lateral_drift()
+                if action == "lateral"
+                else self._perform_downward_review(pause_ms)
+            )
+            remaining_ms = max(0, remaining_ms - used_ms)
+
+            settle_ms = min(
+                remaining_ms,
+                self._random_int_between(self.config.motion.micro_settle_ms),
+            )
+            if settle_ms > 0:
+                self._sleep_ms(settle_ms)
+                remaining_ms -= settle_ms
+
+        if remaining_ms > 0:
+            self._sleep_ms(remaining_ms)
+
     def _sleep_ms(self, delay_ms: int) -> None:
         if delay_ms <= 0:
             return
@@ -1168,7 +1434,7 @@ class HaoceReader:
                 f"{label}: waiting {pause_ms}ms before next upward swipe "
                 f"(random in {low}-{high}ms)"
             )
-        self._sleep_ms(pause_ms)
+        self._perform_pause_actions(label, pause_ms)
 
     def _swipe_ratio(
         self,
@@ -1979,12 +2245,7 @@ class HaoceReader:
             self.config.scroll.duration_ms,
             self.config.scroll.duration_jitter_ms,
         )
-        log(
-            "scroll swipe: start=({0},{1}) end=({2},{3}) duration={4}ms".format(
-                start[0], start[1], end[0], end[1], duration_ms
-            )
-        )
-        self.device.swipe(start, end, duration_ms)
+        self._perform_gesture("scroll swipe", start, end, duration_ms)
 
     def perform_page_turn(self) -> None:
         action = self.config.page_turn.action.lower()
@@ -2011,12 +2272,7 @@ class HaoceReader:
             self.config.page_turn.duration_ms,
             self.config.page_turn.duration_jitter_ms,
         )
-        log(
-            "page-turn swipe: start=({0},{1}) end=({2},{3}) duration={4}ms".format(
-                start[0], start[1], end[0], end[1], duration_ms
-            )
-        )
-        self.device.swipe(start, end, duration_ms)
+        self._perform_gesture("page-turn swipe", start, end, duration_ms)
 
     def run(
         self,

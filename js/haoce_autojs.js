@@ -98,6 +98,15 @@ function randomInt(minValue, maxValue) {
   return low + Math.floor(Math.random() * (high - low + 1));
 }
 
+function randomFloat(minValue, maxValue) {
+  var low = Math.min(minValue, maxValue);
+  var high = Math.max(minValue, maxValue);
+  if (Math.abs(low - high) < 1e-9) {
+    return low;
+  }
+  return low + Math.random() * (high - low);
+}
+
 function shuffleArray(items) {
   for (var i = items.length - 1; i > 0; i -= 1) {
     var j = Math.floor(Math.random() * (i + 1));
@@ -276,6 +285,7 @@ function buildConfig(raw) {
   raw.analysis = raw.analysis || {};
   raw.runtime = raw.runtime || {};
   raw.collection = raw.collection || {};
+  raw.motion = raw.motion || {};
 
   return {
     packageName: choose(raw.package, "app.haoce.com"),
@@ -305,6 +315,17 @@ function buildConfig(raw) {
       durationMs: parseRange(raw.page_turn.duration_ms, 320, 320),
       durationJitterMs: choose(raw.page_turn.duration_jitter_ms, 120),
       settleMs: choose(raw.page_turn.settle_ms, 1500)
+    },
+    motion: {
+      trajectoryPoints: parseRange(raw.motion && raw.motion.trajectory_points, 4, 6),
+      pathJitter: choose(raw.motion && raw.motion.path_jitter, [0.018, 0.026]),
+      lateralChance: choose(raw.motion && raw.motion.lateral_chance, 0.22),
+      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.05, 0.12),
+      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 180, 320),
+      downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.18),
+      downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.06, 0.18),
+      downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 260, 520),
+      microSettleMs: parseRange(raw.motion && raw.motion.micro_settle_ms, 350, 900)
     },
     analysis: {
       crop: choose(raw.analysis.crop, [0.06, 0.12, 0.94, 0.92]),
@@ -566,6 +587,173 @@ HaoceReader.prototype.randomizedDuration = function (rangeValue, jitterMs) {
   return Math.max(1, base + randomInt(-jitterMs, jitterMs));
 };
 
+HaoceReader.prototype.randomFloatBetween = function (rangeValue) {
+  return randomFloat(rangeValue[0], rangeValue[1]);
+};
+
+HaoceReader.prototype.buildTrajectoryPoints = function (start, end) {
+  var pointCount = Math.max(2, randomInt(
+    this.config.motion.trajectoryPoints[0],
+    this.config.motion.trajectoryPoints[1]
+  ));
+  if (pointCount <= 2) {
+    return [start, end];
+  }
+
+  var jitterX = device.width * this.config.motion.pathJitter[0];
+  var jitterY = device.height * this.config.motion.pathJitter[1];
+  var points = [];
+
+  for (var index = 0; index < pointCount; index += 1) {
+    var t = index / (pointCount - 1);
+    var baseX = start[0] + (end[0] - start[0]) * t;
+    var baseY = start[1] + (end[1] - start[1]) * t;
+    var curve = Math.sin(Math.PI * t);
+    var point = [
+      Math.max(0, Math.min(device.width - 1, Math.round(baseX + randomFloat(-jitterX, jitterX) * curve))),
+      Math.max(0, Math.min(device.height - 1, Math.round(baseY + randomFloat(-jitterY, jitterY) * curve)))
+    ];
+    if (!points.length || point[0] !== points[points.length - 1][0] || point[1] !== points[points.length - 1][1]) {
+      points.push(point);
+    }
+  }
+
+  if (points.length < 2) {
+    return [start, end];
+  }
+  points[0] = start;
+  points[points.length - 1] = end;
+  return points;
+};
+
+HaoceReader.prototype.performGesturePath = function (label, start, end, duration) {
+  var points = this.buildTrajectoryPoints(start, end);
+  log(
+    label + ": start=(" + start[0] + "," + start[1] + ") end=(" + end[0] + "," + end[1] +
+    ") duration=" + duration + "ms track_points=" + points.length
+  );
+  if (typeof gesture === "function" && points.length >= 2) {
+    var args = [duration];
+    for (var i = 0; i < points.length; i += 1) {
+      args.push(points[i]);
+    }
+    gesture.apply(null, args);
+    return;
+  }
+  swipe(start[0], start[1], end[0], end[1], duration);
+};
+
+HaoceReader.prototype.pauseRatio = function (pauseMs) {
+  var low = this.config.scroll.pauseMs[0];
+  var high = this.config.scroll.pauseMs[1];
+  if (high <= low) {
+    return 0.5;
+  }
+  return Math.max(0, Math.min(1, (pauseMs - low) / (high - low)));
+};
+
+HaoceReader.prototype.performLateralDrift = function () {
+  var distanceRatio = this.randomFloatBetween(this.config.motion.lateralDistanceRatio);
+  var duration = randomInt(
+    this.config.motion.lateralDurationMs[0],
+    this.config.motion.lateralDurationMs[1]
+  );
+  var centerX = randomFloat(0.42, 0.58);
+  var centerY = randomFloat(0.46, 0.68);
+  var halfDistance = distanceRatio / 2;
+  var direction = Math.random() < 0.5 ? -1 : 1;
+  var start = this.ratioToAbs([
+    centerX - halfDistance * direction,
+    centerY + randomFloat(-0.02, 0.02)
+  ]);
+  var end = this.ratioToAbs([
+    centerX + halfDistance * direction,
+    centerY + randomFloat(-0.02, 0.02)
+  ]);
+  this.performGesturePath("lateral drift swipe", start, end, duration);
+  return duration;
+};
+
+HaoceReader.prototype.performDownwardReview = function (pauseMs) {
+  var pauseRatio = this.pauseRatio(pauseMs);
+  var lowDistance = this.config.motion.downwardDistanceRatio[0];
+  var highDistance = this.config.motion.downwardDistanceRatio[1];
+  var distanceRatio = lowDistance + (highDistance - lowDistance) * pauseRatio;
+  distanceRatio = Math.max(lowDistance, Math.min(highDistance, distanceRatio * randomFloat(0.92, 1.08)));
+  var duration = randomInt(
+    this.config.motion.downwardDurationMs[0],
+    this.config.motion.downwardDurationMs[1]
+  );
+  var startRatio = [
+    randomFloat(0.42, 0.58),
+    randomFloat(0.34, 0.46)
+  ];
+  var endRatio = [
+    startRatio[0] + randomFloat(-0.025, 0.025),
+    Math.min(0.82, startRatio[1] + distanceRatio)
+  ];
+  log(
+    "downward review swipe: pause_ratio=" + pauseRatio.toFixed(2) +
+    ", distance_ratio=" + distanceRatio.toFixed(3)
+  );
+  this.performGesturePath(
+    "downward review swipe",
+    this.ratioToAbs(startRatio),
+    this.ratioToAbs(endRatio),
+    duration
+  );
+  return duration;
+};
+
+HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
+  if (pauseMs <= 0) {
+    return;
+  }
+
+  var actions = [];
+  if (Math.random() < this.config.motion.lateralChance) {
+    actions.push("lateral");
+  }
+  if (Math.random() < this.config.motion.downwardChance) {
+    actions.push("downward");
+  }
+
+  if (!actions.length) {
+    sleepMs(pauseMs);
+    return;
+  }
+
+  shuffleArray(actions);
+  var remainingMs = pauseMs;
+  for (var index = 0; index < actions.length; index += 1) {
+    var slotsLeft = actions.length - index;
+    var waitCap = Math.max(0, Math.floor(remainingMs / (slotsLeft + 1)));
+    if (waitCap > 0) {
+      var waitMs = randomInt(0, waitCap);
+      sleepMs(waitMs);
+      remainingMs = Math.max(0, remainingMs - waitMs);
+    }
+
+    var usedMs = actions[index] === "lateral" ?
+      this.performLateralDrift() :
+      this.performDownwardReview(pauseMs);
+    remainingMs = Math.max(0, remainingMs - usedMs);
+
+    var settleMs = Math.min(
+      remainingMs,
+      randomInt(this.config.motion.microSettleMs[0], this.config.motion.microSettleMs[1])
+    );
+    if (settleMs > 0) {
+      sleepMs(settleMs);
+      remainingMs -= settleMs;
+    }
+  }
+
+  if (remainingMs > 0) {
+    sleepMs(remainingMs);
+  }
+};
+
 HaoceReader.prototype.randomPauseMs = function () {
   return randomInt(this.config.scroll.pauseMs[0], this.config.scroll.pauseMs[1]);
 };
@@ -582,7 +770,7 @@ HaoceReader.prototype.sleepScrollPause = function (label) {
   } else {
     log(label + ": waiting " + pauseMs + "ms before next upward swipe (random in " + low + "-" + high + "ms)");
   }
-  sleepMs(pauseMs);
+  this.performPauseActions(label, pauseMs);
 };
 
 HaoceReader.prototype.launchApp = function () {
@@ -595,8 +783,7 @@ HaoceReader.prototype.performScroll = function () {
   var start = this.randomizedPoint(this.config.scroll.start, this.config.scroll.startJitter);
   var end = this.randomizedPoint(this.config.scroll.end, this.config.scroll.endJitter);
   var duration = this.randomizedDuration(this.config.scroll.durationMs, this.config.scroll.durationJitterMs);
-  log("scroll swipe: start=(" + start[0] + "," + start[1] + ") end=(" + end[0] + "," + end[1] + ") duration=" + duration + "ms");
-  swipe(start[0], start[1], end[0], end[1], duration);
+  this.performGesturePath("scroll swipe", start, end, duration);
 };
 
 HaoceReader.prototype.performPageTurn = function () {
@@ -608,8 +795,7 @@ HaoceReader.prototype.performPageTurn = function () {
   var start = this.randomizedPoint(this.config.pageTurn.start, this.config.pageTurn.startJitter);
   var end = this.randomizedPoint(this.config.pageTurn.end, this.config.pageTurn.endJitter);
   var duration = this.randomizedDuration(this.config.pageTurn.durationMs, this.config.pageTurn.durationJitterMs);
-  log("page-turn swipe: start=(" + start[0] + "," + start[1] + ") end=(" + end[0] + "," + end[1] + ") duration=" + duration + "ms");
-  swipe(start[0], start[1], end[0], end[1], duration);
+  this.performGesturePath("page-turn swipe", start, end, duration);
 };
 
 HaoceReader.prototype.capture = function () {
