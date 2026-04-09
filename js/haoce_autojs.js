@@ -85,6 +85,18 @@ function sleepMs(value) {
   }
 }
 
+function singleTap(x, y) {
+  var tapX = Math.floor(x);
+  var tapY = Math.floor(y);
+  if (typeof press === "function") {
+    try {
+      return press(tapX, tapY, 1);
+    } catch (error) {
+    }
+  }
+  return click(tapX, tapY);
+}
+
 function choose(value, fallbackValue) {
   return value === undefined || value === null ? fallbackValue : value;
 }
@@ -129,6 +141,10 @@ function parseRange(value, fallbackLow, fallbackHigh) {
     }
   }
   return [fallbackLow, fallbackHigh];
+}
+
+function midRange(rangeValue) {
+  return Math.floor((rangeValue[0] + rangeValue[1]) / 2);
 }
 
 function parsePercent(textValue) {
@@ -309,22 +325,23 @@ function buildConfig(raw) {
       action: choose(raw.page_turn.action, "swipe"),
       start: choose(raw.page_turn.start, [0.83, 0.58]),
       end: choose(raw.page_turn.end, [0.17, 0.58]),
-      startJitter: choose(raw.page_turn.start_jitter, [0.018, 0.015]),
-      endJitter: choose(raw.page_turn.end_jitter, [0.018, 0.015]),
+      startJitter: choose(raw.page_turn.start_jitter, [0.0, 0.0]),
+      endJitter: choose(raw.page_turn.end_jitter, [0.0, 0.0]),
       tap: choose(raw.page_turn.tap, null),
       durationMs: parseRange(raw.page_turn.duration_ms, 320, 320),
-      durationJitterMs: choose(raw.page_turn.duration_jitter_ms, 120),
+      durationJitterMs: choose(raw.page_turn.duration_jitter_ms, 0),
       settleMs: choose(raw.page_turn.settle_ms, 1500)
     },
     motion: {
-      trajectoryPoints: parseRange(raw.motion && raw.motion.trajectory_points, 4, 6),
-      pathJitter: choose(raw.motion && raw.motion.path_jitter, [0.018, 0.026]),
-      lateralChance: choose(raw.motion && raw.motion.lateral_chance, 0.22),
-      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.05, 0.12),
-      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 180, 320),
-      downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.18),
+      trajectoryPoints: parseRange(raw.motion && raw.motion.trajectory_points, 3, 4),
+      pathJitter: choose(raw.motion && raw.motion.path_jitter, [0.012, 0.018]),
+      lateralChance: choose(raw.motion && raw.motion.lateral_chance, 0.04),
+      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.03, 0.05),
+      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 120, 180),
+      downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.08),
       downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.06, 0.18),
       downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 260, 520),
+      tapChance: choose(raw.motion && raw.motion.tap_chance, 0.06),
       microSettleMs: parseRange(raw.motion && raw.motion.micro_settle_ms, 350, 900)
     },
     analysis: {
@@ -643,6 +660,14 @@ HaoceReader.prototype.performGesturePath = function (label, start, end, duration
   swipe(start[0], start[1], end[0], end[1], duration);
 };
 
+HaoceReader.prototype.performDirectSwipe = function (label, start, end, duration) {
+  log(
+    label + ": start=(" + start[0] + "," + start[1] + ") end=(" + end[0] + "," + end[1] +
+    ") duration=" + duration + "ms"
+  );
+  swipe(start[0], start[1], end[0], end[1], duration);
+};
+
 HaoceReader.prototype.pauseRatio = function (pauseMs) {
   var low = this.config.scroll.pauseMs[0];
   var high = this.config.scroll.pauseMs[1];
@@ -658,16 +683,15 @@ HaoceReader.prototype.performLateralDrift = function () {
     this.config.motion.lateralDurationMs[0],
     this.config.motion.lateralDurationMs[1]
   );
-  var centerX = randomFloat(0.42, 0.58);
+  var centerX = randomFloat(0.44, 0.52);
   var centerY = randomFloat(0.46, 0.68);
   var halfDistance = distanceRatio / 2;
-  var direction = Math.random() < 0.5 ? -1 : 1;
   var start = this.ratioToAbs([
-    centerX - halfDistance * direction,
+    centerX - halfDistance,
     centerY + randomFloat(-0.02, 0.02)
   ]);
   var end = this.ratioToAbs([
-    centerX + halfDistance * direction,
+    centerX + halfDistance,
     centerY + randomFloat(-0.02, 0.02)
   ]);
   this.performGesturePath("lateral drift swipe", start, end, duration);
@@ -705,6 +729,16 @@ HaoceReader.prototype.performDownwardReview = function (pauseMs) {
   return duration;
 };
 
+HaoceReader.prototype.performRandomTap = function () {
+  var point = this.ratioToAbs([
+    randomFloat(0.44, 0.58),
+    randomFloat(0.40, 0.72)
+  ]);
+  log("random tap: point=(" + point[0] + "," + point[1] + ")");
+  singleTap(point[0], point[1]);
+  return 0;
+};
+
 HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
   if (pauseMs <= 0) {
     return;
@@ -717,36 +751,39 @@ HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
   if (Math.random() < this.config.motion.downwardChance) {
     actions.push("downward");
   }
+  if (Math.random() < this.config.motion.tapChance) {
+    actions.push("tap");
+  }
 
   if (!actions.length) {
     sleepMs(pauseMs);
     return;
   }
 
-  shuffleArray(actions);
+  var action = actions[randomInt(0, actions.length - 1)];
   var remainingMs = pauseMs;
-  for (var index = 0; index < actions.length; index += 1) {
-    var slotsLeft = actions.length - index;
-    var waitCap = Math.max(0, Math.floor(remainingMs / (slotsLeft + 1)));
-    if (waitCap > 0) {
-      var waitMs = randomInt(0, waitCap);
-      sleepMs(waitMs);
-      remainingMs = Math.max(0, remainingMs - waitMs);
-    }
+  var waitMin = Math.min(remainingMs, Math.floor(pauseMs * 0.2));
+  var waitMax = Math.min(remainingMs, Math.max(waitMin, Math.floor(pauseMs * 0.7)));
+  if (waitMax > 0) {
+    var waitMs = waitMin === waitMax ? waitMin : randomInt(waitMin, waitMax);
+    sleepMs(waitMs);
+    remainingMs = Math.max(0, remainingMs - waitMs);
+  }
 
-    var usedMs = actions[index] === "lateral" ?
-      this.performLateralDrift() :
-      this.performDownwardReview(pauseMs);
-    remainingMs = Math.max(0, remainingMs - usedMs);
+  var usedMs = action === "lateral" ?
+    this.performLateralDrift() :
+    action === "downward" ?
+      this.performDownwardReview(pauseMs) :
+      this.performRandomTap();
+  remainingMs = Math.max(0, remainingMs - usedMs);
 
-    var settleMs = Math.min(
-      remainingMs,
-      randomInt(this.config.motion.microSettleMs[0], this.config.motion.microSettleMs[1])
-    );
-    if (settleMs > 0) {
-      sleepMs(settleMs);
-      remainingMs -= settleMs;
-    }
+  var settleMs = Math.min(
+    remainingMs,
+    randomInt(this.config.motion.microSettleMs[0], this.config.motion.microSettleMs[1])
+  );
+  if (settleMs > 0) {
+    sleepMs(settleMs);
+    remainingMs -= settleMs;
   }
 
   if (remainingMs > 0) {
@@ -789,13 +826,13 @@ HaoceReader.prototype.performScroll = function () {
 HaoceReader.prototype.performPageTurn = function () {
   if (this.config.pageTurn.action === "tap" && this.config.pageTurn.tap) {
     var tapPoint = this.ratioToAbs(this.config.pageTurn.tap);
-    click(tapPoint[0], tapPoint[1]);
+    singleTap(tapPoint[0], tapPoint[1]);
     return;
   }
-  var start = this.randomizedPoint(this.config.pageTurn.start, this.config.pageTurn.startJitter);
-  var end = this.randomizedPoint(this.config.pageTurn.end, this.config.pageTurn.endJitter);
-  var duration = this.randomizedDuration(this.config.pageTurn.durationMs, this.config.pageTurn.durationJitterMs);
-  this.performGesturePath("page-turn swipe", start, end, duration);
+  var start = this.ratioToAbs(this.config.pageTurn.start);
+  var end = this.ratioToAbs(this.config.pageTurn.end);
+  var duration = Math.max(120, midRange(this.config.pageTurn.durationMs));
+  this.performDirectSwipe("page-turn swipe", start, end, duration);
 };
 
 HaoceReader.prototype.capture = function () {
@@ -1321,7 +1358,7 @@ HaoceReader.prototype.openHomeCollectionPage = function () {
     var tapBounds = candidate.tapBounds || candidate.bounds;
     var point = rectCenter(tapBounds);
     log("opening collection entry at " + point[0] + "," + point[1] + " (attempt " + (attempt + 1) + ")");
-    click(point[0], point[1]);
+    singleTap(point[0], point[1]);
 
     for (var i = 0; i < 4; i += 1) {
       sleepMs(Math.max(this.config.navigation.prepareWaitMs, 1500));
@@ -1364,14 +1401,14 @@ HaoceReader.prototype.openCollectionCategoryPicker = function () {
   }
   var point = rectCenter(bounds);
   log("opening collection category picker at " + point[0] + "," + point[1]);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(Math.max(this.config.navigation.prepareWaitMs, 1500));
   return true;
 };
 
 HaoceReader.prototype.closeCollectionCategoryPicker = function () {
   var point = this.ratioToAbs([0.92, 0.28]);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(1000);
 };
 
@@ -1442,7 +1479,7 @@ HaoceReader.prototype.chooseRandomCollectionCategory = function () {
   var chosen = allowed[randomInt(0, allowed.length - 1)];
   var point = rectCenter(chosen.bounds);
   log("switching collection category from " + (currentCategory || "<unknown>") + " to " + chosen.name);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(Math.max(this.config.navigation.prepareWaitMs, 2000));
   var updatedCategory = this.currentCollectionCategory();
   if (updatedCategory) {
@@ -1625,13 +1662,13 @@ HaoceReader.prototype.tapContinueIfPresent = function () {
   }
   var point = rectCenter(bounds);
   log("found '" + TEXT_CONTINUE + "', tapping " + point[0] + "," + point[1]);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(this.config.navigation.prepareWaitMs);
   return true;
 };
 
 HaoceReader.prototype.tapDetailUpdateIfPresent = function () {
-  for (var attempt = 0; attempt < 3; attempt += 1) {
+  for (var attempt = 0; attempt < 4; attempt += 1) {
     var exactCandidates = [];
     var rowFallback = null;
     var nodes = this.allNodes();
@@ -1660,7 +1697,7 @@ HaoceReader.prototype.tapDetailUpdateIfPresent = function () {
       });
       var exactPoint = rectCenter(exactCandidates[0]);
       log("found exact '" + TEXT_UPDATE + "', tapping " + exactPoint[0] + "," + exactPoint[1]);
-      click(exactPoint[0], exactPoint[1]);
+      singleTap(exactPoint[0], exactPoint[1]);
       sleepMs(Math.max(this.config.navigation.prepareWaitMs, 1200));
       return true;
     }
@@ -1669,12 +1706,12 @@ HaoceReader.prototype.tapDetailUpdateIfPresent = function () {
       var fallbackX = Math.max(rowFallback.left, rowFallback.right - Math.max(72, Math.floor(rectWidth(rowFallback) * 0.12)));
       var fallbackY = Math.floor((rowFallback.top + rowFallback.bottom) / 2);
       log("found update row fallback, tapping " + fallbackX + "," + fallbackY);
-      click(fallbackX, fallbackY);
+      singleTap(fallbackX, fallbackY);
       sleepMs(Math.max(this.config.navigation.prepareWaitMs, 1200));
       return true;
     }
 
-    sleepMs(250);
+    sleepMs(350);
   }
   return false;
 };
@@ -1682,11 +1719,8 @@ HaoceReader.prototype.tapDetailUpdateIfPresent = function () {
 HaoceReader.prototype.tapDetailUpdateRepeatedly = function (rounds, contextLabel) {
   var totalRounds = Math.max(0, rounds || 0);
   for (var roundIndex = 0; roundIndex < totalRounds; roundIndex += 1) {
-    if (!(text(TEXT_UPDATE).exists() || textContains(TEXT_UPDATE).exists())) {
-      break;
-    }
     log(
-      contextLabel + ": tapping '" + TEXT_UPDATE + "' " +
+      contextLabel + ": checking '" + TEXT_UPDATE + "' " +
       (roundIndex + 1) + "/" + totalRounds
     );
     if (!this.tapDetailUpdateIfPresent()) {
@@ -1715,7 +1749,7 @@ HaoceReader.prototype.tapStartIfPresent = function () {
   }
   var point = rectCenter(bounds);
   log("found '" + TEXT_START + "', tapping " + point[0] + "," + point[1]);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(this.config.navigation.prepareWaitMs);
   return true;
 };
@@ -1723,7 +1757,7 @@ HaoceReader.prototype.tapStartIfPresent = function () {
 HaoceReader.prototype.openRecentBook = function (book) {
   var point = rectCenter(book.bounds);
   log("opening recent book: " + this.describeBook(book) + " at " + point[0] + "," + point[1]);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(this.config.navigation.prepareWaitMs);
   this.tapDetailUpdateRepeatedly(HOME_ENTRY_UPDATE_ROUNDS, "home recent entry sync");
   this.currentBook = this.resolveOpenedBook(book);
@@ -1754,10 +1788,10 @@ HaoceReader.prototype.refreshCurrentBookPage = function () {
 
 HaoceReader.prototype.looksLikeReturnedBookEntryPage = function () {
   var pageName = this.pageName();
-  if (pageName === "home" || pageName === "collection" || pageName === "report") {
+  if (pageName === "home" || pageName === "report") {
     return false;
   }
-  if (pageName !== "detail") {
+  if (!text(TEXT_START).exists() && !textContains(TEXT_START).exists()) {
     return false;
   }
 
@@ -1800,12 +1834,15 @@ HaoceReader.prototype.syncPageAfterBackOnce = function () {
 HaoceReader.prototype.openCollectionBook = function (book) {
   var point = rectCenter(book.bounds);
   log("opening collection book: " + this.describeBook(book) + " at " + point[0] + "," + point[1]);
-  click(point[0], point[1]);
+  singleTap(point[0], point[1]);
   sleepMs(this.config.navigation.prepareWaitMs);
 
   if (this.pageName() === "collection") {
-    log("collection card tap did not leave the collection page");
-    return "open_collection_miss";
+    var stillCollectionList = !this.looksLikeReturnedBookEntryPage() && !this.findClickableTextNode(TEXT_CONTINUE);
+    if (stillCollectionList) {
+      log("collection card tap did not leave the collection page");
+      return "open_collection_miss";
+    }
   }
 
   this.tapDetailUpdateIfPresent();
@@ -1860,7 +1897,7 @@ HaoceReader.prototype.openNextCollectionBookBySlots = function () {
       triedSlots[slotKey] = true;
 
       log("trying collection slot page=" + (pageIndex + 1) + " slot=" + slot.index + " at " + slot.point[0] + "," + slot.point[1]);
-      click(slot.point[0], slot.point[1]);
+      singleTap(slot.point[0], slot.point[1]);
       sleepMs(this.config.navigation.prepareWaitMs + 1000);
 
       var pageName = this.pageName();

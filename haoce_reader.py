@@ -177,6 +177,7 @@ class MotionConfig:
     downward_chance: float
     downward_distance_ratio: tuple[float, float]
     downward_duration_ms: tuple[int, int]
+    tap_chance: float
     micro_settle_ms: tuple[int, int]
 
 
@@ -340,24 +341,24 @@ def load_config(path: Path) -> ReaderConfig:
         ),
         motion=MotionConfig(
             trajectory_points=parse_int_range(
-                motion.get("trajectory_points", [4, 6]),
+                motion.get("trajectory_points", [3, 4]),
                 "motion.trajectory_points",
             ),
             path_jitter=parse_float_range(
-                motion.get("path_jitter", [0.018, 0.026]),
+                motion.get("path_jitter", [0.012, 0.018]),
                 "motion.path_jitter",
             ),
-            lateral_chance=max(0.0, min(1.0, float(motion.get("lateral_chance", 0.22)))),
+            lateral_chance=max(0.0, min(1.0, float(motion.get("lateral_chance", 0.04)))),
             lateral_distance_ratio=parse_float_range(
-                motion.get("lateral_distance_ratio", [0.05, 0.12]),
+                motion.get("lateral_distance_ratio", [0.03, 0.05]),
                 "motion.lateral_distance_ratio",
             ),
             lateral_duration_ms=parse_int_range(
-                motion.get("lateral_duration_ms", [180, 320]),
+                motion.get("lateral_duration_ms", [120, 180]),
                 "motion.lateral_duration_ms",
             ),
             downward_chance=max(
-                0.0, min(1.0, float(motion.get("downward_chance", 0.18)))
+                0.0, min(1.0, float(motion.get("downward_chance", 0.08)))
             ),
             downward_distance_ratio=parse_float_range(
                 motion.get("downward_distance_ratio", [0.06, 0.18]),
@@ -367,6 +368,7 @@ def load_config(path: Path) -> ReaderConfig:
                 motion.get("downward_duration_ms", [260, 520]),
                 "motion.downward_duration_ms",
             ),
+            tap_chance=max(0.0, min(1.0, float(motion.get("tap_chance", 0.06)))),
             micro_settle_ms=parse_int_range(
                 motion.get("micro_settle_ms", [350, 900]),
                 "motion.micro_settle_ms",
@@ -1306,6 +1308,25 @@ class HaoceReader:
         )
         self.device.gesture(points, duration_ms)
 
+    def _perform_direct_swipe(
+        self,
+        label: str,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        duration_ms: int,
+    ) -> None:
+        log(
+            "{0}: start=({1},{2}) end=({3},{4}) duration={5}ms".format(
+                label,
+                start[0],
+                start[1],
+                end[0],
+                end[1],
+                duration_ms,
+            )
+        )
+        self.device.swipe(start, end, duration_ms)
+
     def _pause_ratio(self, pause_ms: int) -> float:
         low, high = self.config.scroll.pause_ms
         if high <= low:
@@ -1318,16 +1339,15 @@ class HaoceReader:
             self.config.motion.lateral_distance_ratio
         )
         duration_ms = self._random_int_between(self.config.motion.lateral_duration_ms)
-        center_x = random.uniform(0.42, 0.58)
+        center_x = random.uniform(0.44, 0.52)
         center_y = random.uniform(0.46, 0.68)
         half_distance = distance_ratio / 2
-        direction = random.choice([-1.0, 1.0])
         start_ratio = (
-            center_x - half_distance * direction,
+            center_x - half_distance,
             center_y + random.uniform(-0.02, 0.02),
         )
         end_ratio = (
-            center_x + half_distance * direction,
+            center_x + half_distance,
             center_y + random.uniform(-0.02, 0.02),
         )
         start = self._clamp_point(self._ratio_to_abs(start_ratio))
@@ -1361,6 +1381,16 @@ class HaoceReader:
         self._perform_gesture("downward review swipe", start, end, duration_ms)
         return duration_ms
 
+    def _perform_random_tap(self) -> int:
+        tap_ratio = (
+            random.uniform(0.44, 0.58),
+            random.uniform(0.40, 0.72),
+        )
+        x, y = self._clamp_point(self._ratio_to_abs(tap_ratio))
+        log(f"random tap: point=({x},{y})")
+        self.device.tap(x, y)
+        return 0
+
     def _perform_pause_actions(
         self,
         label: str,
@@ -1374,36 +1404,39 @@ class HaoceReader:
             actions.append("lateral")
         if random.random() < self.config.motion.downward_chance:
             actions.append("downward")
+        if random.random() < self.config.motion.tap_chance:
+            actions.append("tap")
 
         if not actions:
             self._sleep_ms(pause_ms)
             return
 
-        random.shuffle(actions)
+        action = random.choice(actions)
         remaining_ms = pause_ms
 
-        for index, action in enumerate(actions):
-            slots_left = len(actions) - index
-            wait_cap = max(0, remaining_ms // (slots_left + 1))
-            if wait_cap > 0:
-                wait_ms = random.randint(0, wait_cap)
-                self._sleep_ms(wait_ms)
-                remaining_ms = max(0, remaining_ms - wait_ms)
+        wait_min = min(remaining_ms, int(pause_ms * 0.2))
+        wait_max = min(remaining_ms, max(wait_min, int(pause_ms * 0.7)))
+        if wait_max > 0:
+            wait_ms = wait_min if wait_min == wait_max else random.randint(wait_min, wait_max)
+            self._sleep_ms(wait_ms)
+            remaining_ms = max(0, remaining_ms - wait_ms)
 
-            used_ms = (
-                self._perform_lateral_drift()
-                if action == "lateral"
-                else self._perform_downward_review(pause_ms)
-            )
-            remaining_ms = max(0, remaining_ms - used_ms)
+        used_ms = (
+            self._perform_lateral_drift()
+            if action == "lateral"
+            else self._perform_downward_review(pause_ms)
+            if action == "downward"
+            else self._perform_random_tap()
+        )
+        remaining_ms = max(0, remaining_ms - used_ms)
 
-            settle_ms = min(
-                remaining_ms,
-                self._random_int_between(self.config.motion.micro_settle_ms),
-            )
-            if settle_ms > 0:
-                self._sleep_ms(settle_ms)
-                remaining_ms -= settle_ms
+        settle_ms = min(
+            remaining_ms,
+            self._random_int_between(self.config.motion.micro_settle_ms),
+        )
+        if settle_ms > 0:
+            self._sleep_ms(settle_ms)
+            remaining_ms -= settle_ms
 
         if remaining_ms > 0:
             self._sleep_ms(remaining_ms)
@@ -1485,18 +1518,61 @@ class HaoceReader:
         self,
         root: Optional[ET.Element] = None,
     ) -> ET.Element:
+        updated_root, _ = self._tap_detail_update_once(root)
+        return updated_root
+
+    def _tap_detail_update_once(
+        self,
+        root: Optional[ET.Element] = None,
+    ) -> tuple[ET.Element, bool]:
         if root is None:
             root = self.device.dump_ui()
 
-        button = self.navigator.find_text_bounds(root, UPDATE_BUTTON_TEXT)
-        if not button:
-            return root
+        current_root = root
+        for _ in range(4):
+            exact_candidates: list[tuple[int, int, int, int]] = []
+            row_fallback: Optional[tuple[int, int, int, int]] = None
 
-        x, y = center(button)
-        log(f"found '{UPDATE_BUTTON_TEXT}', tapping {x},{y}")
-        self.device.tap(x, y)
-        self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1200))
-        return self.device.dump_ui()
+            for node in iter_nodes(current_root):
+                text = (node.attrib.get("text") or "").strip()
+                bounds_text = node.attrib.get("bounds")
+                if not text or not bounds_text:
+                    continue
+                bounds = parse_bounds(bounds_text)
+                if area(bounds) <= 0:
+                    continue
+                if text == UPDATE_BUTTON_TEXT:
+                    exact_candidates.append(bounds)
+                    continue
+                if UPDATE_BUTTON_TEXT in text and 760 <= bounds[1] <= 1100:
+                    row_fallback = bounds
+
+            if exact_candidates:
+                exact_candidates.sort(
+                    key=lambda bounds: (area(bounds), -(bounds[2] - bounds[0]))
+                )
+                x, y = center(exact_candidates[0])
+                log(f"found '{UPDATE_BUTTON_TEXT}', tapping {x},{y}")
+                self.device.tap(x, y)
+                self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1200))
+                return self.device.dump_ui(), True
+
+            if row_fallback:
+                x1, y1, x2, y2 = row_fallback
+                target_x = max(x1, x2 - max(72, int((x2 - x1) * 0.12)))
+                target_y = (y1 + y2) // 2
+                log(
+                    f"found '{UPDATE_BUTTON_TEXT}' row fallback, "
+                    f"tapping {target_x},{target_y}"
+                )
+                self.device.tap(target_x, target_y)
+                self._sleep_ms(max(self.config.navigation.prepare_wait_ms, 1200))
+                return self.device.dump_ui(), True
+
+            self._sleep_ms(350)
+            current_root = self.device.dump_ui()
+
+        return current_root, False
 
     def _tap_detail_update_repeatedly(
         self,
@@ -1509,13 +1585,13 @@ class HaoceReader:
 
         current_root = root
         for round_index in range(max(0, rounds)):
-            if not self.navigator.find_text_bounds(current_root, UPDATE_BUTTON_TEXT):
-                break
             log(
-                f"{context_label}: tapping '{UPDATE_BUTTON_TEXT}' "
+                f"{context_label}: checking '{UPDATE_BUTTON_TEXT}' "
                 f"{round_index + 1}/{rounds}"
             )
-            current_root = self._tap_detail_update_if_present(current_root)
+            current_root, tapped = self._tap_detail_update_once(current_root)
+            if not tapped:
+                break
         return current_root
 
     def _tap_start_reading_if_present(self, root: Optional[ET.Element] = None) -> bool:
@@ -1594,7 +1670,7 @@ class HaoceReader:
         root: ET.Element,
     ) -> bool:
         page_name = self.navigator._current_page_name(root)
-        if page_name in {"home", "collection"}:
+        if page_name == "home":
             return False
         if page_name == "report":
             return False
@@ -1645,7 +1721,11 @@ class HaoceReader:
         self.device.tap(x, y)
         self._sleep_ms(self.config.navigation.prepare_wait_ms)
         candidate_root = self.device.dump_ui()
-        if self.navigator._current_page_name(candidate_root) == "collection":
+        if (
+            self.navigator._current_page_name(candidate_root) == "collection"
+            and not self._looks_like_returned_book_entry_page(candidate_root)
+            and not self.navigator.find_clickable_text(candidate_root, CONTINUE_READING_TEXT)
+        ):
             log("collection card tap did not leave the collection page")
             return "open_collection_miss"
 
@@ -2260,19 +2340,11 @@ class HaoceReader:
             raise ConfigError(f"unsupported page_turn.action: {self.config.page_turn.action}")
         if not self.config.page_turn.start or not self.config.page_turn.end:
             raise ConfigError("page_turn.start/end are required when action='swipe'")
-        start = self._randomized_point(
-            self.config.page_turn.start,
-            self.config.page_turn.start_jitter,
-        )
-        end = self._randomized_point(
-            self.config.page_turn.end,
-            self.config.page_turn.end_jitter,
-        )
-        duration_ms = self._randomized_duration(
-            self.config.page_turn.duration_ms,
-            self.config.page_turn.duration_jitter_ms,
-        )
-        self._perform_gesture("page-turn swipe", start, end, duration_ms)
+        start = self._clamp_point(self._ratio_to_abs(self.config.page_turn.start))
+        end = self._clamp_point(self._ratio_to_abs(self.config.page_turn.end))
+        low, high = self.config.page_turn.duration_ms
+        duration_ms = max(120, (low + high) // 2)
+        self._perform_direct_swipe("page-turn swipe", start, end, duration_ms)
 
     def run(
         self,
