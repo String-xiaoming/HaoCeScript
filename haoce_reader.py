@@ -177,7 +177,6 @@ class MotionConfig:
     downward_chance: float
     downward_distance_ratio: tuple[float, float]
     downward_duration_ms: tuple[int, int]
-    tap_chance: float
     micro_settle_ms: tuple[int, int]
 
 
@@ -368,7 +367,6 @@ def load_config(path: Path) -> ReaderConfig:
                 motion.get("downward_duration_ms", [110, 180]),
                 "motion.downward_duration_ms",
             ),
-            tap_chance=max(0.0, min(1.0, float(motion.get("tap_chance", 0.04)))),
             micro_settle_ms=parse_int_range(
                 motion.get("micro_settle_ms", [350, 900]),
                 "motion.micro_settle_ms",
@@ -1381,16 +1379,6 @@ class HaoceReader:
         self._perform_direct_swipe("downward review swipe", start, end, duration_ms)
         return duration_ms
 
-    def _perform_random_tap(self) -> int:
-        tap_ratio = (
-            random.uniform(0.18, 0.82),
-            random.uniform(0.22, 0.78),
-        )
-        x, y = self._clamp_point(self._ratio_to_abs(tap_ratio))
-        log(f"random tap: point=({x},{y})")
-        self.device.tap(x, y)
-        return 0
-
     def _perform_pause_actions(
         self,
         label: str,
@@ -1404,8 +1392,6 @@ class HaoceReader:
             actions.append("lateral")
         if random.random() < self.config.motion.downward_chance:
             actions.append("downward")
-        if random.random() < self.config.motion.tap_chance:
-            actions.append("tap")
 
         if not actions:
             self._sleep_ms(pause_ms)
@@ -1425,8 +1411,6 @@ class HaoceReader:
             self._perform_lateral_drift()
             if action == "lateral"
             else self._perform_downward_review(pause_ms)
-            if action == "downward"
-            else self._perform_random_tap()
         )
         remaining_ms = max(0, remaining_ms - used_ms)
 
@@ -2325,7 +2309,7 @@ class HaoceReader:
             self.config.scroll.duration_ms,
             self.config.scroll.duration_jitter_ms,
         )
-        self._perform_gesture("scroll swipe", start, end, duration_ms)
+        self._perform_direct_swipe("scroll swipe", start, end, duration_ms)
 
     def perform_page_turn(self) -> None:
         action = self.config.page_turn.action.lower()

@@ -347,7 +347,6 @@ function buildConfig(raw) {
       downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.08),
       downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.10, 0.18),
       downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 110, 180),
-      tapChance: choose(raw.motion && raw.motion.tap_chance, 0.04),
       microSettleMs: parseRange(raw.motion && raw.motion.micro_settle_ms, 350, 900)
     },
     analysis: {
@@ -735,16 +734,6 @@ HaoceReader.prototype.performDownwardReview = function (pauseMs) {
   return duration;
 };
 
-HaoceReader.prototype.performRandomTap = function () {
-  var point = this.ratioToAbs([
-    randomFloat(0.18, 0.82),
-    randomFloat(0.22, 0.78)
-  ]);
-  log("random tap: point=(" + point[0] + "," + point[1] + ")");
-  singleTap(point[0], point[1]);
-  return 0;
-};
-
 HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
   if (pauseMs <= 0) {
     return;
@@ -756,9 +745,6 @@ HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
   }
   if (Math.random() < this.config.motion.downwardChance) {
     actions.push("downward");
-  }
-  if (Math.random() < this.config.motion.tapChance) {
-    actions.push("tap");
   }
 
   if (!actions.length) {
@@ -778,9 +764,7 @@ HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
 
   var usedMs = action === "lateral" ?
     this.performLateralDrift() :
-    action === "downward" ?
-      this.performDownwardReview(pauseMs) :
-      this.performRandomTap();
+    this.performDownwardReview(pauseMs);
   remainingMs = Math.max(0, remainingMs - usedMs);
 
   var settleMs = Math.min(
@@ -826,7 +810,7 @@ HaoceReader.prototype.performScroll = function () {
   var start = this.randomizedPoint(this.config.scroll.start, this.config.scroll.startJitter);
   var end = this.randomizedPoint(this.config.scroll.end, this.config.scroll.endJitter);
   var duration = this.randomizedDuration(this.config.scroll.durationMs, this.config.scroll.durationJitterMs);
-  this.performGesturePath("scroll swipe", start, end, duration);
+  this.performDirectSwipe("scroll swipe", start, end, duration);
 };
 
 HaoceReader.prototype.performPageTurn = function () {
