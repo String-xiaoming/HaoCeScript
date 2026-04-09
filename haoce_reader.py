@@ -350,25 +350,25 @@ def load_config(path: Path) -> ReaderConfig:
             ),
             lateral_chance=max(0.0, min(1.0, float(motion.get("lateral_chance", 0.04)))),
             lateral_distance_ratio=parse_float_range(
-                motion.get("lateral_distance_ratio", [0.03, 0.05]),
+                motion.get("lateral_distance_ratio", [0.06, 0.10]),
                 "motion.lateral_distance_ratio",
             ),
             lateral_duration_ms=parse_int_range(
-                motion.get("lateral_duration_ms", [120, 180]),
+                motion.get("lateral_duration_ms", [70, 110]),
                 "motion.lateral_duration_ms",
             ),
             downward_chance=max(
                 0.0, min(1.0, float(motion.get("downward_chance", 0.08)))
             ),
             downward_distance_ratio=parse_float_range(
-                motion.get("downward_distance_ratio", [0.06, 0.18]),
+                motion.get("downward_distance_ratio", [0.10, 0.18]),
                 "motion.downward_distance_ratio",
             ),
             downward_duration_ms=parse_int_range(
-                motion.get("downward_duration_ms", [260, 520]),
+                motion.get("downward_duration_ms", [110, 180]),
                 "motion.downward_duration_ms",
             ),
-            tap_chance=max(0.0, min(1.0, float(motion.get("tap_chance", 0.06)))),
+            tap_chance=max(0.0, min(1.0, float(motion.get("tap_chance", 0.04)))),
             micro_settle_ms=parse_int_range(
                 motion.get("micro_settle_ms", [350, 900]),
                 "motion.micro_settle_ms",
@@ -1339,20 +1339,20 @@ class HaoceReader:
             self.config.motion.lateral_distance_ratio
         )
         duration_ms = self._random_int_between(self.config.motion.lateral_duration_ms)
-        center_x = random.uniform(0.44, 0.52)
-        center_y = random.uniform(0.46, 0.68)
+        center_x = random.uniform(0.40, 0.66)
+        center_y = random.uniform(0.40, 0.74)
         half_distance = distance_ratio / 2
         start_ratio = (
-            center_x - half_distance,
-            center_y + random.uniform(-0.02, 0.02),
+            min(0.92, center_x + half_distance),
+            center_y + random.uniform(-0.015, 0.015),
         )
         end_ratio = (
-            center_x + half_distance,
-            center_y + random.uniform(-0.02, 0.02),
+            max(0.08, center_x - half_distance),
+            center_y + random.uniform(-0.015, 0.015),
         )
         start = self._clamp_point(self._ratio_to_abs(start_ratio))
         end = self._clamp_point(self._ratio_to_abs(end_ratio))
-        self._perform_gesture("lateral drift swipe", start, end, duration_ms)
+        self._perform_direct_swipe("lateral drift swipe", start, end, duration_ms)
         return duration_ms
 
     def _perform_downward_review(self, pause_ms: int) -> int:
@@ -1363,12 +1363,12 @@ class HaoceReader:
         distance_ratio = max(low_distance, min(high_distance, distance_ratio))
         duration_ms = self._random_int_between(self.config.motion.downward_duration_ms)
         start_ratio = (
-            random.uniform(0.42, 0.58),
-            random.uniform(0.34, 0.46),
+            random.uniform(0.24, 0.76),
+            random.uniform(0.28, 0.44),
         )
         end_ratio = (
-            start_ratio[0] + random.uniform(-0.025, 0.025),
-            min(0.82, start_ratio[1] + distance_ratio),
+            start_ratio[0] + random.uniform(-0.02, 0.02),
+            min(0.86, start_ratio[1] + distance_ratio),
         )
         start = self._clamp_point(self._ratio_to_abs(start_ratio))
         end = self._clamp_point(self._ratio_to_abs(end_ratio))
@@ -1378,13 +1378,13 @@ class HaoceReader:
                 distance_ratio,
             )
         )
-        self._perform_gesture("downward review swipe", start, end, duration_ms)
+        self._perform_direct_swipe("downward review swipe", start, end, duration_ms)
         return duration_ms
 
     def _perform_random_tap(self) -> int:
         tap_ratio = (
-            random.uniform(0.44, 0.58),
-            random.uniform(0.40, 0.72),
+            random.uniform(0.18, 0.82),
+            random.uniform(0.22, 0.78),
         )
         x, y = self._clamp_point(self._ratio_to_abs(tap_ratio))
         log(f"random tap: point=({x},{y})")

@@ -69,23 +69,23 @@
     ],
     "lateral_chance": 0.04,
     "lateral_distance_ratio": [
-      0.03,
-      0.05
+      0.06,
+      0.1
     ],
     "lateral_duration_ms": [
-      120,
-      180
+      70,
+      110
     ],
     "downward_chance": 0.08,
     "downward_distance_ratio": [
-      0.06,
+      0.1,
       0.18
     ],
     "downward_duration_ms": [
-      260,
-      520
+      110,
+      180
     ],
-    "tap_chance": 0.06,
+    "tap_chance": 0.04,
     "micro_settle_ms": [
       350,
       900

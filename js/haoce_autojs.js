@@ -88,13 +88,19 @@ function sleepMs(value) {
 function singleTap(x, y) {
   var tapX = Math.floor(x);
   var tapY = Math.floor(y);
+  if (typeof click === "function") {
+    try {
+      return click(tapX, tapY);
+    } catch (error) {
+    }
+  }
   if (typeof press === "function") {
     try {
       return press(tapX, tapY, 1);
     } catch (error) {
     }
   }
-  return click(tapX, tapY);
+  return false;
 }
 
 function choose(value, fallbackValue) {
@@ -336,12 +342,12 @@ function buildConfig(raw) {
       trajectoryPoints: parseRange(raw.motion && raw.motion.trajectory_points, 3, 4),
       pathJitter: choose(raw.motion && raw.motion.path_jitter, [0.012, 0.018]),
       lateralChance: choose(raw.motion && raw.motion.lateral_chance, 0.04),
-      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.03, 0.05),
-      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 120, 180),
+      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.06, 0.10),
+      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 70, 110),
       downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.08),
-      downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.06, 0.18),
-      downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 260, 520),
-      tapChance: choose(raw.motion && raw.motion.tap_chance, 0.06),
+      downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.10, 0.18),
+      downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 110, 180),
+      tapChance: choose(raw.motion && raw.motion.tap_chance, 0.04),
       microSettleMs: parseRange(raw.motion && raw.motion.micro_settle_ms, 350, 900)
     },
     analysis: {
@@ -683,18 +689,18 @@ HaoceReader.prototype.performLateralDrift = function () {
     this.config.motion.lateralDurationMs[0],
     this.config.motion.lateralDurationMs[1]
   );
-  var centerX = randomFloat(0.44, 0.52);
-  var centerY = randomFloat(0.46, 0.68);
+  var centerX = randomFloat(0.40, 0.66);
+  var centerY = randomFloat(0.40, 0.74);
   var halfDistance = distanceRatio / 2;
   var start = this.ratioToAbs([
-    centerX - halfDistance,
-    centerY + randomFloat(-0.02, 0.02)
+    Math.min(0.92, centerX + halfDistance),
+    centerY + randomFloat(-0.015, 0.015)
   ]);
   var end = this.ratioToAbs([
-    centerX + halfDistance,
-    centerY + randomFloat(-0.02, 0.02)
+    Math.max(0.08, centerX - halfDistance),
+    centerY + randomFloat(-0.015, 0.015)
   ]);
-  this.performGesturePath("lateral drift swipe", start, end, duration);
+  this.performDirectSwipe("lateral drift swipe", start, end, duration);
   return duration;
 };
 
@@ -709,18 +715,18 @@ HaoceReader.prototype.performDownwardReview = function (pauseMs) {
     this.config.motion.downwardDurationMs[1]
   );
   var startRatio = [
-    randomFloat(0.42, 0.58),
-    randomFloat(0.34, 0.46)
+    randomFloat(0.24, 0.76),
+    randomFloat(0.28, 0.44)
   ];
   var endRatio = [
-    startRatio[0] + randomFloat(-0.025, 0.025),
-    Math.min(0.82, startRatio[1] + distanceRatio)
+    startRatio[0] + randomFloat(-0.02, 0.02),
+    Math.min(0.86, startRatio[1] + distanceRatio)
   ];
   log(
     "downward review swipe: pause_ratio=" + pauseRatio.toFixed(2) +
     ", distance_ratio=" + distanceRatio.toFixed(3)
   );
-  this.performGesturePath(
+  this.performDirectSwipe(
     "downward review swipe",
     this.ratioToAbs(startRatio),
     this.ratioToAbs(endRatio),
@@ -731,8 +737,8 @@ HaoceReader.prototype.performDownwardReview = function (pauseMs) {
 
 HaoceReader.prototype.performRandomTap = function () {
   var point = this.ratioToAbs([
-    randomFloat(0.44, 0.58),
-    randomFloat(0.40, 0.72)
+    randomFloat(0.18, 0.82),
+    randomFloat(0.22, 0.78)
   ]);
   log("random tap: point=(" + point[0] + "," + point[1] + ")");
   singleTap(point[0], point[1]);
