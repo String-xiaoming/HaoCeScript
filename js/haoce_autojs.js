@@ -9,6 +9,8 @@ var SCRIPT_DIR = (function () {
   return files.cwd();
 }());
 
+var SCRIPT_VERSION = "2026-04-11-js-interval-v2";
+
 // Optional external config. If absent, the script uses built-in defaults.
 var DEFAULT_CONFIG_PATH = files.join(SCRIPT_DIR, "config.json");
 var KNOWN_COLLECTION_CATEGORIES = [
@@ -336,17 +338,19 @@ function buildConfig(raw) {
       tap: choose(raw.page_turn.tap, null),
       durationMs: parseRange(raw.page_turn.duration_ms, 320, 320),
       durationJitterMs: choose(raw.page_turn.duration_jitter_ms, 0),
-      settleMs: choose(raw.page_turn.settle_ms, 1500)
+      settleMs: choose(raw.page_turn.settle_ms, 1500),
+      minIntervalMs: Math.max(0, choose(raw.page_turn.min_interval_ms, 210000))
     },
     motion: {
       trajectoryPoints: parseRange(raw.motion && raw.motion.trajectory_points, 3, 4),
       pathJitter: choose(raw.motion && raw.motion.path_jitter, [0.012, 0.018]),
-      lateralChance: choose(raw.motion && raw.motion.lateral_chance, 0.04),
-      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.06, 0.10),
-      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 70, 110),
-      downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.08),
-      downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.10, 0.18),
-      downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 110, 180),
+      lateralChance: choose(raw.motion && raw.motion.lateral_chance, 0.0),
+      lateralDistanceRatio: parseRange(raw.motion && raw.motion.lateral_distance_ratio, 0.012, 0.022),
+      lateralDurationMs: parseRange(raw.motion && raw.motion.lateral_duration_ms, 45, 70),
+      upwardChance: choose(raw.motion && raw.motion.upward_chance, 0.18),
+      downwardChance: choose(raw.motion && raw.motion.downward_chance, 0.06),
+      downwardDistanceRatio: parseRange(raw.motion && raw.motion.downward_distance_ratio, 0.05, 0.09),
+      downwardDurationMs: parseRange(raw.motion && raw.motion.downward_duration_ms, 90, 140),
       microSettleMs: parseRange(raw.motion && raw.motion.micro_settle_ms, 350, 900)
     },
     analysis: {
@@ -688,18 +692,18 @@ HaoceReader.prototype.performLateralDrift = function () {
     this.config.motion.lateralDurationMs[0],
     this.config.motion.lateralDurationMs[1]
   );
-  var centerX = randomFloat(0.40, 0.66);
+  var centerX = randomFloat(0.36, 0.70);
   var centerY = randomFloat(0.40, 0.74);
   var halfDistance = distanceRatio / 2;
   var start = this.ratioToAbs([
     Math.min(0.92, centerX + halfDistance),
-    centerY + randomFloat(-0.015, 0.015)
+    centerY + randomFloat(-0.012, 0.012)
   ]);
   var end = this.ratioToAbs([
     Math.max(0.08, centerX - halfDistance),
-    centerY + randomFloat(-0.015, 0.015)
+    centerY + randomFloat(-0.012, 0.012)
   ]);
-  this.performDirectSwipe("lateral drift swipe", start, end, duration);
+  this.performDirectSwipe("left drift swipe", start, end, duration);
   return duration;
 };
 
@@ -734,17 +738,55 @@ HaoceReader.prototype.performDownwardReview = function (pauseMs) {
   return duration;
 };
 
-HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
+HaoceReader.prototype.performUpwardIntervalSwipe = function () {
+  var start = this.ratioToAbs([
+    randomFloat(0.44, 0.56),
+    randomFloat(0.76, 0.82)
+  ]);
+  var end = this.ratioToAbs([
+    randomFloat(0.42, 0.58),
+    randomFloat(0.46, 0.54)
+  ]);
+  var duration = this.randomizedDuration(this.config.scroll.durationMs, this.config.scroll.durationJitterMs);
+  this.performDirectSwipe("interval upward swipe", start, end, duration);
+  return duration;
+};
+
+HaoceReader.prototype.performPauseActions = function (label, pauseMs, options) {
   if (pauseMs <= 0) {
     return;
   }
 
+  options = options || {};
+  var allowLateral = options.allowLateral === true;
+  var allowDownward = options.allowDownward !== false;
+  var allowUpward = options.allowUpward !== false;
+  var forceRandom = options.forceRandom === true;
   var actions = [];
-  if (Math.random() < this.config.motion.lateralChance) {
+  if (allowLateral && Math.random() < this.config.motion.lateralChance) {
     actions.push("lateral");
   }
-  if (Math.random() < this.config.motion.downwardChance) {
+  if (allowDownward && Math.random() < this.config.motion.downwardChance) {
     actions.push("downward");
+  }
+  if (allowUpward && Math.random() < this.config.motion.upwardChance) {
+    actions.push("upward");
+  }
+
+  if (forceRandom && !actions.length) {
+    var fallbackActions = [];
+    if (allowUpward) {
+      fallbackActions.push("upward");
+    }
+    if (allowDownward) {
+      fallbackActions.push("downward");
+    }
+    if (allowLateral) {
+      fallbackActions.push("lateral");
+    }
+    if (fallbackActions.length) {
+      actions.push(fallbackActions[randomInt(0, fallbackActions.length - 1)]);
+    }
   }
 
   if (!actions.length) {
@@ -764,6 +806,8 @@ HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
 
   var usedMs = action === "lateral" ?
     this.performLateralDrift() :
+    action === "upward" ?
+      this.performUpwardIntervalSwipe() :
     this.performDownwardReview(pauseMs);
   remainingMs = Math.max(0, remainingMs - usedMs);
 
@@ -778,6 +822,43 @@ HaoceReader.prototype.performPauseActions = function (label, pauseMs) {
 
   if (remainingMs > 0) {
     sleepMs(remainingMs);
+  }
+};
+
+HaoceReader.prototype.enforcePageTurnInterval = function (lastPageTurnAt) {
+  var minIntervalMs = this.config.pageTurn.minIntervalMs;
+  if (!lastPageTurnAt || minIntervalMs <= 0) {
+    return;
+  }
+
+  var elapsedMs = new Date().getTime() - lastPageTurnAt;
+  var remainingMs = minIntervalMs - elapsedMs;
+  if (remainingMs <= 0) {
+    return;
+  }
+
+  log(
+    "page-turn interval guard: waiting at least " + remainingMs +
+    "ms before next right swipe (remaining " + remainingMs +
+    "ms, min_interval=" + minIntervalMs + "ms)"
+  );
+
+  var chunkLow = Math.max(20000, this.config.scroll.pauseMs[0]);
+  var chunkHigh = Math.max(chunkLow, Math.max(30000, this.config.scroll.pauseMs[1]));
+
+  while (remainingMs > 0) {
+    var chunkMs = Math.min(
+      remainingMs,
+      chunkLow === chunkHigh ? chunkLow : randomInt(chunkLow, chunkHigh)
+    );
+    this.performPauseActions("page-turn interval pause", chunkMs, {
+      allowLateral: false,
+      allowDownward: true,
+      allowUpward: true,
+      forceRandom: true
+    });
+    elapsedMs = new Date().getTime() - lastPageTurnAt;
+    remainingMs = Math.max(0, minIntervalMs - elapsedMs);
   }
 };
 
@@ -797,7 +878,12 @@ HaoceReader.prototype.sleepScrollPause = function (label) {
   } else {
     log(label + ": waiting " + pauseMs + "ms before next upward swipe (random in " + low + "-" + high + "ms)");
   }
-  this.performPauseActions(label, pauseMs);
+  this.performPauseActions(label, pauseMs, {
+    allowLateral: false,
+    allowDownward: true,
+    allowUpward: true,
+    forceRandom: false
+  });
 };
 
 HaoceReader.prototype.launchApp = function () {
@@ -2216,7 +2302,12 @@ HaoceReader.prototype.run = function (skipPrepare, maxPageTurnsOverride) {
   var pageTurns = 0;
   var stuckCount = 0;
   var iteration = 0;
+  var lastPageTurnAt = new Date().getTime();
 
+  log(
+    "page-turn interval baseline initialized from current reading session, " +
+    "min_interval=" + this.config.pageTurn.minIntervalMs + "ms"
+  );
   log("reader loop started");
   while (true) {
     iteration += 1;
@@ -2241,7 +2332,9 @@ HaoceReader.prototype.run = function (skipPrepare, maxPageTurnsOverride) {
         continue;
       }
 
+      this.enforcePageTurnInterval(lastPageTurnAt);
       var beforeTurn = this.capture();
+      var pageTurnStartedAt = new Date().getTime();
       this.performPageTurn();
       sleepMs(this.config.pageTurn.settleMs);
       var afterTurn = this.capture();
@@ -2254,11 +2347,17 @@ HaoceReader.prototype.run = function (skipPrepare, maxPageTurnsOverride) {
         pageTurns += 1;
         stuckCount = 0;
         pauseAfterPageTurn = true;
+        lastPageTurnAt = pageTurnStartedAt;
         log("moved to next section, total page turns: " + pageTurns);
       } else {
         var switchResult = this.switchToNextBook();
         if (switchResult === "opened_next" || switchResult === "reopen_current") {
           stuckCount = 0;
+          lastPageTurnAt = new Date().getTime();
+          log(
+            "page-turn interval baseline reset after reopening/switching book, " +
+            "min_interval=" + this.config.pageTurn.minIntervalMs + "ms"
+          );
           pauseAfterBookSwitch = true;
         } else if (switchResult === "all_done") {
           return 0;
@@ -2298,6 +2397,7 @@ HaoceReader.prototype.run = function (skipPrepare, maxPageTurnsOverride) {
 
 function main() {
   auto.waitFor();
+  log("script version: " + SCRIPT_VERSION);
   if (!requestScreenCapture()) {
     throw new Error("requestScreenCapture failed");
   }
