@@ -136,7 +136,7 @@ class PageTurnConfig:
     duration_ms: tuple[int, int]
     duration_jitter_ms: int
     settle_ms: int
-    min_interval_ms: int
+    min_interval_ms: tuple[int, int]
 
 
 @dataclass
@@ -198,6 +198,16 @@ class ReaderConfig:
 class DiffMetrics:
     mean_diff: float
     changed_ratio: float
+
+
+@dataclass(frozen=True)
+class DownwardReviewPlan:
+    start: tuple[int, int]
+    end: tuple[int, int]
+    duration_ms: int
+    pause_ratio: float
+    distance_ratio: float
+    proportional_pause_ms: int
 
 
 @dataclass(frozen=True)
@@ -311,7 +321,10 @@ def load_config(path: Path) -> ReaderConfig:
             ),
             duration_jitter_ms=int(page_turn.get("duration_jitter_ms", 0)),
             settle_ms=int(page_turn.get("settle_ms", 1500)),
-            min_interval_ms=max(0, int(page_turn.get("min_interval_ms", 210000))),
+            min_interval_ms=parse_int_range(
+                page_turn.get("min_interval_ms", [192000, 270000]),
+                "page_turn.min_interval_ms",
+            ),
         ),
         analysis=AnalysisConfig(
             crop=tuple(analysis["crop"]),
@@ -350,27 +363,29 @@ def load_config(path: Path) -> ReaderConfig:
                 motion.get("path_jitter", [0.012, 0.018]),
                 "motion.path_jitter",
             ),
-            lateral_chance=max(0.0, min(1.0, float(motion.get("lateral_chance", 0.0)))),
+            lateral_chance=max(
+                0.0, min(1.0, float(motion.get("lateral_chance", 0.05)))
+            ),
             lateral_distance_ratio=parse_float_range(
-                motion.get("lateral_distance_ratio", [0.012, 0.022]),
+                motion.get("lateral_distance_ratio", [0.035, 0.055]),
                 "motion.lateral_distance_ratio",
             ),
             lateral_duration_ms=parse_int_range(
-                motion.get("lateral_duration_ms", [45, 70]),
+                motion.get("lateral_duration_ms", [150, 240]),
                 "motion.lateral_duration_ms",
             ),
             upward_chance=max(
-                0.0, min(1.0, float(motion.get("upward_chance", 0.18)))
+                0.0, min(1.0, float(motion.get("upward_chance", 0.0)))
             ),
             downward_chance=max(
-                0.0, min(1.0, float(motion.get("downward_chance", 0.06)))
+                0.0, min(1.0, float(motion.get("downward_chance", 0.08)))
             ),
             downward_distance_ratio=parse_float_range(
-                motion.get("downward_distance_ratio", [0.05, 0.09]),
+                motion.get("downward_distance_ratio", [0.018, 0.09]),
                 "motion.downward_distance_ratio",
             ),
             downward_duration_ms=parse_int_range(
-                motion.get("downward_duration_ms", [90, 140]),
+                motion.get("downward_duration_ms", [80, 180]),
                 "motion.downward_duration_ms",
             ),
             micro_settle_ms=parse_int_range(
@@ -1053,6 +1068,7 @@ class HaoceReader:
         )
         self.selection_blacklist_titles: set[str] = set()
         self.selection_blacklist_keys: set[str] = set()
+        self.pending_page_turn_interval_ms: Optional[int] = None
         self._load_selection_blacklist()
 
     def _normalize_book_title(self, title: Optional[str]) -> Optional[str]:
@@ -1255,6 +1271,77 @@ class HaoceReader:
         low, high = value_range
         return low if math.isclose(low, high) else random.uniform(low, high)
 
+    def _format_ms_range(self, value_range: tuple[int, int]) -> str:
+        low, high = value_range
+        return f"{low}ms" if low == high else f"{low}-{high}ms"
+
+    def _page_turn_interval_target_ms(self) -> int:
+        if self.pending_page_turn_interval_ms is None:
+            self.pending_page_turn_interval_ms = self._random_int_between(
+                self.config.page_turn.min_interval_ms
+            )
+            low, high = self.config.page_turn.min_interval_ms
+            if low == high:
+                log(
+                    "page-turn interval target locked at "
+                    f"{self.pending_page_turn_interval_ms}ms"
+                )
+            else:
+                log(
+                    "page-turn interval target selected "
+                    f"{self.pending_page_turn_interval_ms}ms "
+                    f"(random in {low}-{high}ms)"
+                )
+        return self.pending_page_turn_interval_ms
+
+    def _reset_page_turn_interval_target(self) -> None:
+        self.pending_page_turn_interval_ms = None
+
+    def _build_downward_review_plan(self, pause_ms: int) -> DownwardReviewPlan:
+        pause_ratio = self._pause_ratio(pause_ms)
+        low_distance, high_distance = self.config.motion.downward_distance_ratio
+        distance_ratio = low_distance + (high_distance - low_distance) * pause_ratio
+        distance_ratio *= random.uniform(0.9, 1.08)
+        distance_ratio = max(low_distance, min(high_distance, distance_ratio))
+
+        distance_progress = max(
+            0.0,
+            min(1.0, distance_ratio / max(high_distance, 0.001)),
+        )
+        duration_low, duration_high = self.config.motion.downward_duration_ms
+        duration_ms = int(
+            round(duration_low + (duration_high - duration_low) * distance_progress)
+        )
+        duration_ms = int(round(duration_ms * random.uniform(0.92, 1.08)))
+        duration_ms = max(duration_low, min(duration_high, duration_ms))
+
+        start_ratio = (
+            random.uniform(0.24, 0.76),
+            random.uniform(0.28, 0.44),
+        )
+        end_ratio = (
+            start_ratio[0] + random.uniform(-0.02, 0.02),
+            min(0.86, start_ratio[1] + distance_ratio),
+        )
+
+        reference_pause_ms = max(1000, (self.config.scroll.pause_ms[0] + self.config.scroll.pause_ms[1]) // 2)
+        proportional_pause_ms = int(
+            round(reference_pause_ms * distance_ratio / max(high_distance, 0.001))
+        )
+        proportional_pause_ms = int(
+            round(proportional_pause_ms * random.uniform(0.94, 1.08))
+        )
+        proportional_pause_ms = max(1200, proportional_pause_ms)
+
+        return DownwardReviewPlan(
+            start=self._clamp_point(self._ratio_to_abs(start_ratio)),
+            end=self._clamp_point(self._ratio_to_abs(end_ratio)),
+            duration_ms=duration_ms,
+            pause_ratio=pause_ratio,
+            distance_ratio=distance_ratio,
+            proportional_pause_ms=proportional_pause_ms,
+        )
+
     def _build_trajectory_points(
         self,
         start: tuple[int, int],
@@ -1339,51 +1426,57 @@ class HaoceReader:
         return max(0.0, min(1.0, ratio))
 
     def _perform_lateral_drift(self) -> int:
-        distance_ratio = self._random_float_between(
-            self.config.motion.lateral_distance_ratio
+        if self.screen_size == (0, 0):
+            self.screen_size = self.device.wm_size()
+        width, height = self.screen_size
+
+        configured_distance_px = int(
+            round(width * self._random_float_between(self.config.motion.lateral_distance_ratio))
         )
+        min_distance_px = max(40, int(round(width * 0.035)))
+        max_distance_px = max(min_distance_px + 8, int(round(width * 0.06)))
+        distance_px = max(min_distance_px, min(max_distance_px, configured_distance_px))
         duration_ms = self._random_int_between(self.config.motion.lateral_duration_ms)
         center_x = random.uniform(0.36, 0.70)
-        center_y = random.uniform(0.40, 0.74)
-        half_distance = distance_ratio / 2
+        center_y = random.uniform(0.48, 0.76)
+        half_distance = distance_px / (2 * max(width, 1))
+        y_drift = random.uniform(-0.003, 0.003)
         start_ratio = (
             min(0.92, center_x + half_distance),
-            center_y + random.uniform(-0.012, 0.012),
+            center_y + y_drift,
         )
         end_ratio = (
             max(0.08, center_x - half_distance),
-            center_y + random.uniform(-0.012, 0.012),
+            center_y + random.uniform(-0.002, 0.002),
         )
         start = self._clamp_point(self._ratio_to_abs(start_ratio))
         end = self._clamp_point(self._ratio_to_abs(end_ratio))
-        self._perform_direct_swipe("left drift swipe", start, end, duration_ms)
-        return duration_ms
-
-    def _perform_downward_review(self, pause_ms: int) -> int:
-        pause_ratio = self._pause_ratio(pause_ms)
-        low_distance, high_distance = self.config.motion.downward_distance_ratio
-        distance_ratio = low_distance + (high_distance - low_distance) * pause_ratio
-        distance_ratio *= random.uniform(0.92, 1.08)
-        distance_ratio = max(low_distance, min(high_distance, distance_ratio))
-        duration_ms = self._random_int_between(self.config.motion.downward_duration_ms)
-        start_ratio = (
-            random.uniform(0.24, 0.76),
-            random.uniform(0.28, 0.44),
-        )
-        end_ratio = (
-            start_ratio[0] + random.uniform(-0.02, 0.02),
-            min(0.86, start_ratio[1] + distance_ratio),
-        )
-        start = self._clamp_point(self._ratio_to_abs(start_ratio))
-        end = self._clamp_point(self._ratio_to_abs(end_ratio))
+        actual_distance_px = abs(start[0] - end[0])
         log(
-            "downward review swipe: pause_ratio={0:.2f}, distance_ratio={1:.3f}".format(
-                pause_ratio,
-                distance_ratio,
+            "left drift plan: horizontal_distance={0}px, vertical_delta={1}px".format(
+                actual_distance_px,
+                abs(start[1] - end[1]),
             )
         )
-        self._perform_direct_swipe("downward review swipe", start, end, duration_ms)
+        self._perform_gesture("left drift swipe", start, end, duration_ms)
         return duration_ms
+
+    def _perform_downward_review(self, plan: DownwardReviewPlan) -> int:
+        log(
+            "downward review swipe: pause_ratio={0:.2f}, distance_ratio={1:.3f}, "
+            "proportional_pause={2}ms".format(
+                plan.pause_ratio,
+                plan.distance_ratio,
+                plan.proportional_pause_ms,
+            )
+        )
+        self._perform_direct_swipe(
+            "downward review swipe",
+            plan.start,
+            plan.end,
+            plan.duration_ms,
+        )
+        return plan.duration_ms
 
     def _perform_upward_interval_swipe(self) -> int:
         start = self._clamp_point(
@@ -1417,16 +1510,25 @@ class HaoceReader:
         allow_downward: bool = True,
         allow_upward: bool = True,
         force_random: bool = False,
+        chance_scale: float = 1.0,
+        compress_downward_pause: bool = False,
     ) -> None:
         if pause_ms <= 0:
             return
 
+        chance_scale = max(0.0, chance_scale)
         actions: list[str] = []
-        if allow_lateral and random.random() < self.config.motion.lateral_chance:
+        if allow_lateral and random.random() < min(
+            1.0, self.config.motion.lateral_chance * chance_scale
+        ):
             actions.append("lateral")
-        if allow_downward and random.random() < self.config.motion.downward_chance:
+        if allow_downward and random.random() < min(
+            1.0, self.config.motion.downward_chance * chance_scale
+        ):
             actions.append("downward")
-        if allow_upward and random.random() < self.config.motion.upward_chance:
+        if allow_upward and random.random() < min(
+            1.0, self.config.motion.upward_chance * chance_scale
+        ):
             actions.append("upward")
 
         if force_random and not actions:
@@ -1445,10 +1547,23 @@ class HaoceReader:
             return
 
         action = random.choice(actions)
-        remaining_ms = pause_ms
+        downward_plan = (
+            self._build_downward_review_plan(pause_ms) if action == "downward" else None
+        )
+        active_pause_ms = pause_ms
+        if downward_plan and compress_downward_pause:
+            active_pause_ms = min(pause_ms, downward_plan.proportional_pause_ms)
+            if active_pause_ms != pause_ms:
+                log(
+                    f"{label}: proportional downward pause {active_pause_ms}ms "
+                    f"(original {pause_ms}ms)"
+                )
 
-        wait_min = min(remaining_ms, int(pause_ms * 0.2))
-        wait_max = min(remaining_ms, max(wait_min, int(pause_ms * 0.7)))
+        remaining_ms = active_pause_ms
+
+        wait_min = min(remaining_ms, int(active_pause_ms * 0.2))
+        wait_max = min(remaining_ms, max(wait_min, int(active_pause_ms * 0.7)))
+        wait_ms = 0
         if wait_max > 0:
             wait_ms = wait_min if wait_min == wait_max else random.randint(wait_min, wait_max)
             self._sleep_ms(wait_ms)
@@ -1459,7 +1574,9 @@ class HaoceReader:
             if action == "lateral"
             else self._perform_upward_interval_swipe()
             if action == "upward"
-            else self._perform_downward_review(pause_ms)
+            else self._perform_downward_review(
+                downward_plan or self._build_downward_review_plan(pause_ms)
+            )
         )
         remaining_ms = max(0, remaining_ms - used_ms)
 
@@ -1471,6 +1588,12 @@ class HaoceReader:
             self._sleep_ms(settle_ms)
             remaining_ms -= settle_ms
 
+        log(
+            f"{label}: action={action}, pre_wait={wait_ms}ms, "
+            f"action_duration={used_ms}ms, settle={settle_ms}ms, "
+            f"post_wait={remaining_ms}ms, total={active_pause_ms}ms"
+        )
+
         if remaining_ms > 0:
             self._sleep_ms(remaining_ms)
 
@@ -1478,10 +1601,12 @@ class HaoceReader:
         self,
         last_page_turn_at: Optional[float],
     ) -> None:
-        min_interval_ms = self.config.page_turn.min_interval_ms
-        if min_interval_ms <= 0 or last_page_turn_at is None:
+        low, high = self.config.page_turn.min_interval_ms
+        if high <= 0 or last_page_turn_at is None:
+            self._reset_page_turn_interval_target()
             return
 
+        min_interval_ms = self._page_turn_interval_target_ms()
         elapsed_ms = int((time.monotonic() - last_page_turn_at) * 1000)
         remaining_ms = min_interval_ms - elapsed_ms
         if remaining_ms <= 0:
@@ -1496,8 +1621,8 @@ class HaoceReader:
             )
         )
 
-        chunk_low = max(20000, self.config.scroll.pause_ms[0])
-        chunk_high = max(chunk_low, max(30000, self.config.scroll.pause_ms[1]))
+        chunk_low = max(30000, self.config.scroll.pause_ms[0] * 2)
+        chunk_high = max(chunk_low, max(55000, self.config.scroll.pause_ms[1] * 3))
 
         while remaining_ms > 0:
             chunk_ms = min(
@@ -1507,10 +1632,12 @@ class HaoceReader:
             self._perform_pause_actions(
                 "page-turn interval pause",
                 chunk_ms,
-                allow_lateral=False,
+                allow_lateral=True,
                 allow_downward=True,
-                allow_upward=True,
-                force_random=True,
+                allow_upward=False,
+                force_random=remaining_ms <= chunk_ms,
+                chance_scale=0.45,
+                compress_downward_pause=False,
             )
             elapsed_ms = int((time.monotonic() - last_page_turn_at) * 1000)
             remaining_ms = max(0, min_interval_ms - elapsed_ms)
@@ -1544,10 +1671,12 @@ class HaoceReader:
         self._perform_pause_actions(
             label,
             pause_ms,
-            allow_lateral=False,
+            allow_lateral=True,
             allow_downward=True,
-            allow_upward=True,
+            allow_upward=False,
             force_random=False,
+            chance_scale=1.0,
+            compress_downward_pause=True,
         )
 
     def _swipe_ratio(
@@ -2421,10 +2550,21 @@ class HaoceReader:
             raise ConfigError(f"unsupported page_turn.action: {self.config.page_turn.action}")
         if not self.config.page_turn.start or not self.config.page_turn.end:
             raise ConfigError("page_turn.start/end are required when action='swipe'")
-        start = self._clamp_point(self._ratio_to_abs(self.config.page_turn.start))
-        end = self._clamp_point(self._ratio_to_abs(self.config.page_turn.end))
-        low, high = self.config.page_turn.duration_ms
-        duration_ms = max(120, (low + high) // 2)
+        start = self._randomized_point(
+            self.config.page_turn.start,
+            self.config.page_turn.start_jitter,
+        )
+        end = self._randomized_point(
+            self.config.page_turn.end,
+            self.config.page_turn.end_jitter,
+        )
+        duration_ms = max(
+            120,
+            self._randomized_duration(
+                self.config.page_turn.duration_ms,
+                self.config.page_turn.duration_jitter_ms,
+            ),
+        )
         self._perform_direct_swipe("page-turn swipe", start, end, duration_ms)
 
     def run(
@@ -2453,7 +2593,7 @@ class HaoceReader:
 
         log(
             "page-turn interval baseline initialized from current reading session, "
-            f"min_interval={self.config.page_turn.min_interval_ms}ms"
+            f"min_interval={self._format_ms_range(self.config.page_turn.min_interval_ms)}"
         )
         log("reader loop started")
         while True:
@@ -2501,15 +2641,17 @@ class HaoceReader:
                     stuck_count = 0
                     pause_after_page_turn = True
                     last_page_turn_at = page_turn_started_at
+                    self._reset_page_turn_interval_target()
                     log(f"moved to next section, total page turns: {page_turns}")
                 else:
                     switch_result = self._switch_to_next_book()
                     if switch_result in {"opened_next", "reopen_current"}:
                         stuck_count = 0
                         last_page_turn_at = time.monotonic()
+                        self._reset_page_turn_interval_target()
                         log(
                             "page-turn interval baseline reset after reopening/switching book, "
-                            f"min_interval={self.config.page_turn.min_interval_ms}ms"
+                            f"min_interval={self._format_ms_range(self.config.page_turn.min_interval_ms)}"
                         )
                         pause_after_book_switch = True
                     elif switch_result == "all_done":
