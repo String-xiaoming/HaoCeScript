@@ -1,0 +1,15 @@
+{
+  "scroll": {
+    "pause_ms": [1000, 1500],
+    "settle_ms": 900,
+    "duration_ms": [420, 560]
+  },
+  "page_turn": {
+    "min_interval_ms": [6000, 8000],
+    "settle_ms": 1200,
+    "duration_ms": [260, 320]
+  },
+  "runtime": {
+    "loop_sleep_ms": 250
+  }
+}
